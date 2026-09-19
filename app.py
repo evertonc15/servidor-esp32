@@ -83,6 +83,9 @@ def pagina():
 {% else %}<tr><td colspan="3">Nenhuma placa registrada ainda.</td></tr>{% endfor %}</table>
 <p><a href="/placas">Consultar JSON das placas</a> · <a href="/temperatura">Última leitura do DHT11</a></p></html>''', placas=placas)
 
+from esp_backend import instalar
+instalar(app, db)
+
 if __name__ == '__main__':
     from waitress import serve
     print('Servidor ESP32: http://localhost:5050', flush=True)

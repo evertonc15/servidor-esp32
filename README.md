@@ -26,3 +26,29 @@ python app.py
 Abra http://localhost:5050 no computador Linux. Na ESP32, utilize http://IP_DO_LINUX:5050 como serverUrl. Para manter a aplicação ativa após fechar o terminal e reiniciar, configure um serviço systemd.
 
 O banco de dados, ambientes virtuais e arquivos locais do Windows são excluídos do Git pelo .gitignore.
+
+## Backend do agente e comandos da ESP32
+
+Requer Python 3.11 ou superior. Backend de decisão adaptado de [atividade-peas-v1](https://github.com/vonderheidon/atividade-peas-v1), sem interface 3D. A origem e o commit estão em agente_peas/ORIGEM.md.
+
+- `POST /ventilador` ou `POST /interf/ligarventilador`: envia um GET para `/ventilador` da ESP32.
+- `POST /umidificador` ou `POST /interf/ligarumidificador`: envia um GET para `/umidificador` da ESP32.
+- `GET /esp/conexao`: testa a conexão consultando `/nivel`, sem pulsar relés.
+- `POST /agente/decidir` com JSON `{"modo":"reativo"}` ou `{"modo":"cognitivo"}`: usa a leitura recente da placa (até 5 minutos) e retorna o plano do agente, sem executá-lo.
+
+Seleção de placa: acrescente `?placa=esp32c3vent`. Sem esse parâmetro, é necessário existir exatamente uma placa registrada via `/meuip`.
+
+```bash
+curl http://localhost:5050/esp/conexao
+curl -X POST http://localhost:5050/ventilador
+curl -X POST http://localhost:5050/umidificador
+curl -X POST http://localhost:5050/agente/decidir -H 'Content-Type: application/json' -d '{"modo":"reativo"}'
+```
+
+Cada comando gera UM clique. Ambos os aparelhos têm um ciclo de três cliques, mas a sequência exata dos modos ainda precisa ser informada. Os nomes legados `ligar...` não garantem estado ligado. O backend não repete requisições, não presume estado físico e não executa automaticamente os planos binários do simulador. Um timeout pode ocorrer após o clique já ter sido executado.
+
+O plano original também pode incluir janela, ar-condicionado e lâmpada, que não existem nesta montagem. Sensores adicionais e estados usam o preset conforto e aparecem explicitamente como contexto presumido na resposta. Feedback e aprendizagem não estão ativados. Para execução automática real, é necessário mapear os três modos de cada aparelho e sincronizar o estado inicial, ou alterar o firmware para expor comandos e leitura de estado.
+
+A ESP32 atual usa HTTP síncrono para enviar `/ajustar`. Por isso essa rota apenas armazena a leitura: chamar a ESP32 de volta dentro da mesma requisição impediria o firmware de atender o comando a tempo.
+
+Testes: `python -m unittest -v test_backend.py` (transporte HTTP simulado, sem acionar equipamentos).
