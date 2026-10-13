@@ -1,2 +1,8 @@
 Flask>=3.1,<4
 waitress>=3,<4
+SQLAlchemy>=2.0,<2.1
+psycopg[binary]>=3.2,<4
+python-dotenv>=1,<2
+tzdata>=2024
+zeroconf>=0.151,<1
+ifaddr>=0.2,<1

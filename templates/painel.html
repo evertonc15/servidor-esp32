@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="pt-BR">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agente do quarto — TCC</title>
+<style>body{font:16px system-ui;margin:40px auto;max-width:850px;padding:20px;color:#123;background:#f3f6fa}section{background:white;padding:24px;border-radius:12px;margin:18px 0}button,select{font:inherit;padding:10px;margin:5px;cursor:pointer}pre{white-space:pre-wrap}#erro{color:#a21}</style></head>
+<body><h1>Agente do quarto</h1>
+<label>Placa <select id="placa"></select></label><p id="erro" role="status"></p>
+<section><h2>Preparação</h2><p>Antes de sincronizar, deixe os dois aparelhos fisicamente desligados. Se usar um botão físico ou reiniciar a ESP32, pause o agente e sincronize novamente.</p>
+<button id="sync">Confirmar ambos desligados</button>
+<select id="modo"><option value="cognitivo">Cognitivo e adaptativo</option><option value="reativo">Reativo</option></select>
+<button id="ativar">Ativar automático</button><button id="pausar">Pausar</button>
+<p id="resumo"></p></section>
+<section><h2>Última decisão</h2><pre id="decisao">Aguardando leitura da ESP32.</pre>
+<p>O que achou desta decisão?</p><button id="gostei" disabled>Gostei</button><button id="naogostei" disabled>Não gostei</button><p id="feedback"></p></section>
+<p><a id="analise" href="/analise">Análise dos dados</a> · <a id="historico" href="/historico">Histórico</a></p>
+<script>
+const el=id=>document.getElementById(id); let atual=null;
+const url=rota=>rota+'?placa='+encodeURIComponent(el('placa').value);
+async function api(rota,body){const r=await fetch(url(rota),body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await r.json();if(!r.ok)throw new Error(data.erro||'Falha na operação.');return data;}
+async function atualizar(){try{if(!el('placa').value)return;atual=await api('/agente/status');el('resumo').textContent=(atual.automatico?'Automático ativo':'Automático pausado')+' | ESP: '+atual.ip+(atual.ip_fixo?' (IP fixo)':'')+' | estados estimados: '+JSON.stringify(atual.estados_estimados);const d=atual.decisao;el('decisao').textContent=d?d.propostas.map(p=>p.dispositivo+': '+p.comando+' — '+p.justificativa).join('\n')+'\nExecução: '+d.status:'Aguardando leitura da ESP32.';const habilitar=d&&d.status==='executada'&&d.modo==='cognitivo'&&atual.feedback===null;el('gostei').disabled=!habilitar;el('naogostei').disabled=!habilitar;el('feedback').textContent=atual.feedback===null?'':(atual.feedback?'Gostei registrado.':'Não gostei registrado.');el('analise').href=url('/analise');el('historico').href=url('/historico');}catch(e){el('erro').textContent=e.message;}}
+async function acao(rota,body){el('erro').textContent='';try{await api(rota,body);await atualizar();}catch(e){el('erro').textContent=e.message;}}
+el('sync').onclick=()=>acao('/agente/sincronizar',{ventilador:false,umidificador:false});
+el('ativar').onclick=()=>acao('/agente/configurar',{automatico:true,modo:el('modo').value});
+el('pausar').onclick=()=>acao('/agente/configurar',{automatico:false});
+el('gostei').onclick=()=>acao('/agente/feedback',{decisao_id:atual.decisao.decisao_id,gostei:true});
+el('naogostei').onclick=()=>acao('/agente/feedback',{decisao_id:atual.decisao.decisao_id,gostei:false});
+el('placa').onchange=atualizar;
+async function iniciar(){try{const r=await fetch('/placas');const ps=await r.json();el('placa').replaceChildren(...ps.map(p=>new Option(p.placa,p.placa)));if(!ps.length)el('erro').textContent='Nenhuma placa registrada. Ligue a ESP32 para ela enviar /meuip.';else el('erro').textContent='';await atualizar();}catch(e){el('erro').textContent=e.message;}}
+iniciar();setInterval(()=>el('placa').value?atualizar():iniciar(),5000);
+</script></body></html>

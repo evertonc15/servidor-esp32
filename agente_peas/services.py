@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 from copy import deepcopy
+from hashlib import sha256
 import json
 from math import isfinite
 from typing import (
@@ -15,7 +16,7 @@ from typing import (
     TypedDict,
     cast,
 )
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from .config import (
     Binary,
@@ -30,7 +31,10 @@ from .config import (
     estado_quarto,
     invalidate_decision,
     reset_state as reset_config_state,
+    validate_trace,
 )
+from .shared import peas_protocol as protocol
+from .shared.peas_protocol import MAX_TRACE_PAGE_LIMIT, CycleMetrics, RunSummary
 
 
 DeviceName: TypeAlias = Literal[
@@ -45,22 +49,28 @@ ActionName: TypeAlias = Literal[
     "fechar",
     "ventilar",
     "resfriar",
+    "ventilacao_natural",
+    "ventilacao_assistida",
+    "circulacao_interna",
+    "resfriamento",
+    "resfriamento_assistido",
     "umidificar",
     "iluminar",
+]
+StrategyId: TypeAlias = Literal[
+    "manter",
+    "ventilacao_natural",
+    "ventilacao_assistida",
+    "circulacao_interna",
+    "resfriamento",
+    "resfriamento_assistido",
+    "umidificacao",
+    "iluminacao",
 ]
 TemperatureBand: TypeAlias = Literal["frio", "conforto", "calor"]
 TimeBand: TypeAlias = Literal["madrugada", "amanhecer", "dia", "noite"]
 CognitiveMode: TypeAlias = Literal["cognitivo"]
 FeedbackType: TypeAlias = Literal["aceitar", "rejeitar", "corrigir"]
-LearningContextKey: TypeAlias = tuple[
-    PresetName,
-    CognitiveMode,
-    TimeBand,
-    Binary,
-    TemperatureBand,
-    Luminosity,
-    Binary,
-]
 PreferenceKey: TypeAlias = str
 DecisionObjective: TypeAlias = Literal[
     "seguranca",
@@ -110,7 +120,7 @@ class PlanStep(TypedDict):
 
 
 class LearningContext(TypedDict):
-    """Snapshot contextual capturado para a aprendizagem cognitiva."""
+    """Context snapshot retained for explanation and decision correlation."""
 
     hora: NotRequired[int]
     preset: PresetName
@@ -143,7 +153,7 @@ class CorrectionCommand(TypedDict):
 
 
 class LearningResult(TypedDict):
-    """Resultado de uma alteração de preferência contextual."""
+    """Result of changing an objective and strategy preference."""
 
     contexto: LearningContext
     acao: ActionName
@@ -156,17 +166,26 @@ class DecisionAlternative(TypedDict):
     """Alternativa cognitiva avaliada pelo agente."""
 
     acao: ActionName
-    pontuacao_base: float
+    strategy_id: str
+    pontuacao_base: float | None
     preferencia_contextual: int
-    pontuacao_total: float
+    pontuacao_total: float | None
     elegivel: bool
     influenciada: bool
     motivo_bloqueio: str | None
     correcoes_permitidas: list[CorrectionCommand]
-    conforto: NotRequired[float]
-    economia: NotRequired[float]
-    preferencia: NotRequired[int]
+    conforto: NotRequired[float | None]
+    economia: NotRequired[float | None]
+    custo: NotRequired[int | None]
+    preferencia: NotRequired[float]
     utilidade: NotRequired[float | None]
+    temperatura_projetada: NotRequired[float | None]
+    temperatura_em_tres_horas: NotRequired[float | None]
+    conforto_horizonte: NotRequired[float | None]
+    penalidade_troca: NotRequired[float]
+    preferencia_estrategia: NotRequired[int]
+    ajuste_familia_ar: NotRequired[int]
+    motivo_influencia: NotRequired[str]
 
 
 class FeedbackResult(TypedDict):
@@ -191,6 +210,7 @@ class Decision(TypedDict):
     modo: Mode
     objetivo: DecisionObjective
     acao: ActionName
+    strategy_id: str
     acoes: NotRequired[list[ActionName]]
     status: DecisionStatus
     alternativas: list[DecisionAlternative]
@@ -226,6 +246,14 @@ class PresetRequest(TypedDict):
 
 class ResetRequest(TypedDict):
     """Corpo vazio aceito pela operação de reset."""
+
+
+class TraceQueryRequest(TypedDict):
+    """Validated parameters for one trace page."""
+
+    run_id: str
+    cursor: int | None
+    limit: int
 
 
 class ManualRequest(TypedDict, total=False):
@@ -286,6 +314,8 @@ ErrorCode: TypeAlias = Literal[
     "feedback_conflitante",
     "preferencia_no_limite",
     "acao_insegura",
+    "run_inexistente",
+    "trace_cursor_pruned",
     "erro_interno",
 ]
 
@@ -309,7 +339,14 @@ MAX_HUMIDITY_PCT: Final[float] = 100.0
 TEMP_COLD_LIMIT_C: Final[float] = 22.0
 TEMP_CLIMATE_OFF_C: Final[float] = 23.0
 TEMP_HOT_LIMIT_C: Final[float] = 25.0
+COGNITIVE_COOL_ON_C: Final[float] = 26.0
+COGNITIVE_CLIMATE_OFF_C: Final[float] = 23.0
+LEARNED_HEAT_CEILING_C: Final[float] = 32.0
+THERMAL_HORIZON_HOURS: Final[int] = 3
+THERMAL_SWITCH_PENALTY: Final[float] = 0.04
 TEMP_LIMIT_C: Final[float] = TEMP_HOT_LIMIT_C
+PERCEIVED_AIRFLOW_COOLING_C: Final[float] = 0.3
+PERCEIVED_EXCHANGE_COOLING_C: Final[float] = 0.7
 _ENVIRONMENT_FIELDS: Final[tuple[str, ...]] = (
     "hora",
     "temperatura_externa",
@@ -331,41 +368,66 @@ _DEVICE_NAMES: Final[tuple[DeviceName, ...]] = (
     "umidificador",
     "lampada",
 )
+_ACTION_ALIASES: Final[dict[str, str]] = {
+    "ventilar": "ventilacao_assistida",
+    "resfriar": "resfriamento",
+}
+_LEGACY_THERMAL_ACTIONS: Final[dict[str, str]] = {
+    "ventilacao_assistida": "ventilar",
+    "resfriamento": "resfriar",
+}
+_THERMAL_STRATEGIES: Final[tuple[StrategyId, ...]] = (
+    "manter",
+    "ventilacao_natural",
+    "ventilacao_assistida",
+    "circulacao_interna",
+    "resfriamento",
+    "resfriamento_assistido",
+)
+_THERMAL_VECTORS: Final[dict[StrategyId, tuple[Binary, Binary, Binary]]] = {
+    "ventilacao_natural": (1, 0, 0),
+    "ventilacao_assistida": (1, 0, 1),
+    "circulacao_interna": (0, 0, 1),
+    "resfriamento": (0, 1, 0),
+    "resfriamento_assistido": (0, 1, 1),
+}
+_THERMAL_MATCH_VECTORS: Final[
+    dict[StrategyId, tuple[Binary, Binary, Binary]]
+] = {
+    "manter": (0, 0, 0),
+    **_THERMAL_VECTORS,
+}
 _PLAN_STEPS: Final[
-    dict[ActionName, tuple[tuple[DeviceName, Binary], ...]]
+    dict[str, tuple[tuple[DeviceName, Binary], ...]]
 ] = {
     "manter": (),
-    "ventilar": (("ar", 0), ("janela", 1), ("ventilador", 1)),
-    "resfriar": (("janela", 0), ("ar", 1), ("ventilador", 0)),
+    "ventilacao_natural": (("ar", 0), ("ventilador", 0), ("janela", 1)),
+    "ventilacao_assistida": (("ar", 0), ("janela", 1), ("ventilador", 1)),
+    "circulacao_interna": (("janela", 0), ("ar", 0), ("ventilador", 1)),
+    "resfriamento": (("janela", 0), ("ventilador", 0), ("ar", 1)),
+    "resfriamento_assistido": (("janela", 0), ("ar", 1), ("ventilador", 1)),
     "fechar": (("janela", 0), ("ar", 0), ("ventilador", 0)),
     "umidificar": (("umidificador", 1),),
     "iluminar": (("lampada", 1),),
 }
-_ACTION_ECONOMY: Final[dict[ActionName, float]] = {
-    "manter": 1.0,
-    "fechar": 1.0,
-    "ventilar": 0.75,
-    "iluminar": 0.75,
-    "umidificar": 0.5,
-    "resfriar": 0.0,
+_DEVICE_COSTS: Final[dict[DeviceName, int]] = {
+    "janela": 0,
+    "ar": 4,
+    "ventilador": 1,
+    "umidificador": 1,
+    "lampada": 1,
 }
-_ACTION_COST: Final[dict[ActionName, int]] = {
+_ACTION_ORDER: Final[dict[str, int]] = {
     "manter": 0,
-    "fechar": 3,
-    "ventilar": 3,
-    "resfriar": 3,
-    "umidificar": 1,
-    "iluminar": 1,
+    "ventilacao_natural": 1,
+    "ventilacao_assistida": 2,
+    "circulacao_interna": 3,
+    "resfriamento": 4,
+    "resfriamento_assistido": 5,
+    "fechar": 6,
+    "umidificar": 7,
+    "iluminar": 8,
 }
-_ACTION_ORDER: Final[dict[ActionName, int]] = {
-    "manter": 0,
-    "fechar": 1,
-    "ventilar": 2,
-    "resfriar": 3,
-    "umidificar": 4,
-    "iluminar": 5,
-}
-_UTILITY_EPSILON: Final[float] = 0.01
 _FEEDBACK_DELTAS: Final[dict[str, tuple[FeedbackType, Literal[-1, 1]]]] = {
     "aceitar": ("aceitar", 1),
     "rejeitar": ("rejeitar", -1),
@@ -375,21 +437,36 @@ _FEEDBACK_DELTAS: Final[dict[str, tuple[FeedbackType, Literal[-1, 1]]]] = {
     "manual_correction": ("corrigir", -1),
 }
 _FEEDBACK_REAPPLICATION_CONDITION: Final[str] = (
-    "Reaplicável para a mesma identidade congelada e a mesma ação."
+    "Reaplicável para o mesmo objetivo e a mesma estratégia."
 )
 _CORRECTION_MATRIX: Final[
-    dict[ActionName, tuple[tuple[str, DeviceName, Binary], ...]]
+    dict[str, tuple[tuple[str, DeviceName, Binary], ...]]
 ] = {
     "manter": (),
-    "ventilar": (
+    "ventilacao_natural": (
         ("/interf/ligarar", "ar", 1),
         ("/interf/fechar", "janela", 0),
         ("/interf/desligarventilador", "ventilador", 0),
     ),
-    "resfriar": (
+    "ventilacao_assistida": (
+        ("/interf/ligarar", "ar", 1),
+        ("/interf/fechar", "janela", 0),
+        ("/interf/desligarventilador", "ventilador", 0),
+    ),
+    "circulacao_interna": (
+        ("/interf/abrir", "janela", 1),
+        ("/interf/ligarar", "ar", 1),
+        ("/interf/desligarventilador", "ventilador", 0),
+    ),
+    "resfriamento": (
         ("/interf/abrir", "janela", 1),
         ("/interf/desligarar", "ar", 0),
         ("/interf/ligarventilador", "ventilador", 1),
+    ),
+    "resfriamento_assistido": (
+        ("/interf/abrir", "janela", 1),
+        ("/interf/desligarar", "ar", 0),
+        ("/interf/desligarventilador", "ventilador", 0),
     ),
     "fechar": (
         ("/interf/abrir", "janela", 1),
@@ -403,11 +480,14 @@ _CORRECTION_MATRIX: Final[
         ("/interf/desligarlampada", "lampada", 0),
     ),
 }
-_CORRECTION_OBJECTIVES: Final[dict[ActionName, tuple[DecisionObjective, ...]]] = {
+_CORRECTION_OBJECTIVES: Final[dict[str, tuple[DecisionObjective, ...]]] = {
     "manter": ("umidade", "termico", "iluminacao", "manutencao"),
     "fechar": ("termico",),
-    "ventilar": ("termico",),
-    "resfriar": ("termico",),
+    "ventilacao_natural": ("termico",),
+    "ventilacao_assistida": ("termico",),
+    "circulacao_interna": ("termico",),
+    "resfriamento": ("termico",),
+    "resfriamento_assistido": ("termico",),
     "umidificar": ("umidade",),
     "iluminar": ("iluminacao",),
 }
@@ -428,6 +508,8 @@ CORRECTION_INCOMPATIBLE: Final[ErrorCode] = "correcao_incompativel"
 FEEDBACK_CONFLICTING: Final[ErrorCode] = "feedback_conflitante"
 PREFERENCE_AT_LIMIT: Final[ErrorCode] = "preferencia_no_limite"
 UNSAFE_ACTION: Final[ErrorCode] = "acao_insegura"
+RUN_NOT_FOUND: Final[ErrorCode] = "run_inexistente"
+TRACE_CURSOR_PRUNED: Final[ErrorCode] = "trace_cursor_pruned"
 INTERNAL_ERROR: Final[ErrorCode] = "erro_interno"
 
 # Descriptive aliases retained for the naming variants used by integrations.
@@ -452,6 +534,8 @@ ERROR_CODES: Final[tuple[ErrorCode, ...]] = (
     FEEDBACK_CONFLICTING,
     PREFERENCE_AT_LIMIT,
     UNSAFE_ACTION,
+    RUN_NOT_FOUND,
+    TRACE_CURSOR_PRUNED,
     INTERNAL_ERROR,
 )
 
@@ -472,6 +556,8 @@ _ERROR_STATUS_CODES: Final[dict[ErrorCode, int]] = {
     FEEDBACK_CONFLICTING: 409,
     PREFERENCE_AT_LIMIT: 409,
     UNSAFE_ACTION: 409,
+    RUN_NOT_FOUND: 404,
+    TRACE_CURSOR_PRUNED: 410,
     INTERNAL_ERROR: 500,
 }
 
@@ -594,12 +680,9 @@ def advance_humidity(
         para calcular a variação e não altera o estado do quarto.
     """
 
-    if humidifier_on:
-        humidity_delta = 4.0
-    elif window_open:
-        humidity_delta = -2.0
-    else:
-        humidity_delta = 0.0
+    humidity_delta = (4.0 if humidifier_on else 0.0) + (
+        -2.0 if window_open else 0.0
+    )
 
     return _clamp(
         current_humidity + humidity_delta,
@@ -733,6 +816,52 @@ def _ensure_window_opening_is_safe(
         )
 
 
+def _ensure_device_command_is_safe(
+    state: RoomState,
+    device: DeviceName,
+    command: Binary,
+) -> None:
+    """Reject actuator commands that violate live interlocks or saturation."""
+
+    devices = state["dispositivos"]
+    unsafe_window = devices["janela"] == 1 and (
+        state["chuva"] == 1 or state["presenca_externa"] == 1
+    )
+    interlock_conflict = devices["janela"] == 1 and devices["ar"] == 1
+    if unsafe_window and not (device == "janela" and command == 0):
+        _fail(
+            UNSAFE_ACTION,
+            "O estado atual exige fechar a janela antes de outros comandos.",
+            ["dispositivo"],
+        )
+    if interlock_conflict and not (
+        (device == "janela" and command == 0)
+        or (device == "ar" and command == 0)
+    ):
+        _fail(
+            UNSAFE_ACTION,
+            "O estado atual viola o intertravamento entre janela e ar-condicionado.",
+            ["dispositivo"],
+        )
+    _ensure_window_opening_is_safe(state, device, command)
+    if device == "ar" and command == 1 and devices["janela"] == 1:
+        _fail(
+            UNSAFE_ACTION,
+            "Ligar o ar-condicionado com a janela aberta é inseguro.",
+            ["dispositivo"],
+        )
+    if (
+        device == "umidificador"
+        and command == 1
+        and state["umidade"] >= MAX_HUMIDITY_PCT
+    ):
+        _fail(
+            UNSAFE_ACTION,
+            "Ligar o umidificador com a umidade em 100% é inseguro.",
+            ["dispositivo"],
+        )
+
+
 def _ensure_preset_selected(state: RoomState) -> None:
     """Require an explicitly selected preset before a stateful journey step."""
 
@@ -747,9 +876,10 @@ def _ensure_preset_selected(state: RoomState) -> None:
 def _normalise_action(action: ActionName | str) -> ActionName:
     """Valida e estreita o nome de ação usado pelo plano binário."""
 
-    if action not in _PLAN_STEPS:
+    canonical_action = _ACTION_ALIASES.get(action, action)
+    if canonical_action not in _PLAN_STEPS:
         raise ValueError(f"Ação desconhecida: {action!r}")
-    return cast(ActionName, action)
+    return cast(ActionName, canonical_action)
 
 
 def _normalise_mode(mode: Mode | str) -> Mode:
@@ -823,51 +953,109 @@ def _learning_identity(
     }
 
 
-def _learning_context_key(context: LearningContext) -> LearningContextKey:
-    """Converte o contexto normativo em sua chave imutável."""
+def _strategy_id(action: ActionName | str) -> str:
+    """Normalize a displayed action to its canonical preference strategy."""
 
-    return (
-        context["preset"],
-        context["modo"],
-        context["faixa_horario"],
-        context["dormir"],
-        context["faixa_temperatura"],
-        context["luminosidade"],
-        context["presenca_interna"],
-    )
+    if action == "umidificacao":
+        return "umidificacao"
+    if action == "iluminacao":
+        return "iluminacao"
+    canonical_action = _normalise_action(action)
+    if canonical_action == "umidificar":
+        return "umidificacao"
+    if canonical_action == "iluminar":
+        return "iluminacao"
+    if canonical_action == "fechar":
+        return "manter"
+    return canonical_action
 
 
-def _preference_key(
-    context: LearningContext,
-    action: ActionName,
+def _default_preference_objective(action: ActionName | str) -> DecisionObjective:
+    """Infer the legacy helper's objective when callers omit it."""
+
+    strategy_id = _strategy_id(action)
+    if strategy_id == "umidificacao":
+        return "umidade"
+    if strategy_id == "iluminacao":
+        return "iluminacao"
+    if action == "fechar":
+        return "seguranca"
+    return "termico"
+
+
+def _preference_key_for_strategy(
+    objective: DecisionObjective | str,
+    strategy_id: str,
 ) -> PreferenceKey:
-    """Combina e serializa a identidade contextual e a ação."""
+    """Serialize only the objective and canonical strategy as memory identity."""
 
     return json.dumps(
-        (*_learning_context_key(context), action),
+        (objective, _strategy_id(strategy_id)),
         ensure_ascii=False,
         separators=(",", ":"),
     )
 
 
+def _preference_key(
+    context: LearningContext,
+    action: ActionName | str,
+    objective: DecisionObjective | None = None,
+) -> PreferenceKey:
+    """Return the normative preference key, keeping context explanatory only."""
+
+    selected_objective = objective or _default_preference_objective(action)
+    _ = context
+    return _preference_key_for_strategy(selected_objective, _strategy_id(action))
+
+
 def _preference_for(
     state: RoomState,
     context: LearningContext,
-    action: ActionName,
+    action: ActionName | str,
+    objective: DecisionObjective | None = None,
 ) -> int:
-    """Lê uma preferência contextual limitada sem persistência externa."""
+    """Read the preference for an objective and strategy pair."""
 
-    value = state["preferencias"].get(_preference_key(context, action), 0)
+    value = state["preferencias"].get(
+        _preference_key(context, action, objective),
+        0,
+    )
     if type(value) is not int:
-        raise ValueError("A preferência contextual deve ser um inteiro.")
+        raise ValueError("A preferência deve ser um inteiro.")
     return max(-3, min(3, value))
+
+
+def _effective_thermal_preference(
+    state: RoomState,
+    context: LearningContext,
+    action: ActionName,
+    final_devices: Mapping[str, object],
+) -> int:
+    """Share feedback only between the two active air-conditioning strategies."""
+
+    direct = _preference_for(state, context, action, "termico")
+    if final_devices.get("ar") != 1:
+        return direct
+    if action == "resfriamento":
+        related_action = "resfriamento_assistido"
+    elif action == "resfriamento_assistido":
+        related_action = "resfriamento"
+    else:
+        return direct
+    family = min(
+        0,
+        _preference_for(state, context, related_action, "termico"),
+    )
+    return max(-3, min(3, direct + family))
 
 
 def _allowed_corrections(action: ActionName) -> list[CorrectionCommand]:
     """Materializa a matriz inversa no formato do contrato da decisão."""
 
     corrections: list[CorrectionCommand] = []
-    for route, device, command in _CORRECTION_MATRIX.get(action, ()):
+    for route, device, command in _CORRECTION_MATRIX.get(
+        _normalise_action(action), ()
+    ):
         corrections.append(
             {
                 "rota": route,
@@ -928,17 +1116,55 @@ def _climate_shutdown_pending(devices: Mapping[str, object]) -> bool:
     )
 
 
+def calculate_comfort(temperature: float) -> float:
+    """Calculate normalized thermal comfort for one room temperature."""
+
+    if 22 <= temperature <= 25:
+        comfort = 1.0
+    elif temperature < 22:
+        comfort = _clamp((temperature - 10) / 12, 0.0, 1.0)
+    else:
+        comfort = _clamp((38 - temperature) / 13, 0.0, 1.0)
+    return round(comfort, 2)
+
+
+def calculate_cost(device_state: Mapping[str, object]) -> int:
+    """Sum the hourly cost of devices that are on in a final state."""
+
+    return sum(
+        cost
+        for device, cost in _DEVICE_COSTS.items()
+        if device_state.get(device) == 1
+    )
+
+
+def calculate_economy(cost: int) -> float:
+    """Calculate rounded economy from the final device cost."""
+
+    return round(_clamp(1 - cost / 5, 0.0, 1.0), 2)
+
+
+def calculate_preference_adjustment(preference: int) -> float:
+    """Convert bounded learning preference into its normative score offset."""
+
+    return round(_clamp(preference / 10, -0.3, 0.3), 2)
+
+
+def _calculate_base_score(comfort: float, economy: float) -> float:
+    """Calculate the normative weighted score before preference adjustment."""
+
+    return 0.6 * comfort + 0.4 * economy
+
+
 def calculate_utility(
     conforto: float,
     economia: float,
     preferencia: int,
 ) -> float:
-    """Calcula a utilidade normativa de uma alternativa elegível."""
+    """Calculate total utility with the normalized preference offset."""
 
-    return round(
-        0.6 * conforto + 0.4 * economia + preferencia,
-        2,
-    )
+    adjustment = calculate_preference_adjustment(preferencia)
+    return round(_calculate_base_score(conforto, economia) + adjustment, 2)
 
 
 def _cognitive_actions(
@@ -959,10 +1185,10 @@ def _cognitive_actions(
         return ("fechar",), "seguranca"
     if readings["umidade"] < 40:
         return ("umidificar", "manter"), "umidade"
-    if temperature > TEMP_HOT_LIMIT_C:
-        return ("ventilar", "resfriar", "manter"), "termico"
     if temperature < TEMP_COLD_LIMIT_C and _cold_action_pending(devices):
-        return ("fechar", "manter"), "termico"
+        return ("fechar",), "termico"
+    if temperature > COGNITIVE_COOL_ON_C or devices["ar"] == 1:
+        return _thermal_actions(state), "termico"
     if temperature <= TEMP_CLIMATE_OFF_C and _climate_shutdown_pending(devices):
         return ("manter",), "termico"
     if _lighting_action_pending(readings, devices):
@@ -970,87 +1196,250 @@ def _cognitive_actions(
     return ("manter",), "manutencao"
 
 
+def _thermal_vector(
+    action: str,
+    devices: Mapping[str, object],
+) -> tuple[object, object, object]:
+    """Return a candidate's canonical (window, AC, fan) vector."""
+
+    canonical_action = _normalise_action(action)
+    if canonical_action == "manter":
+        return (
+            devices.get("janela"),
+            devices.get("ar"),
+            devices.get("ventilador"),
+        )
+    return _THERMAL_VECTORS[cast(StrategyId, canonical_action)]
+
+
+def _strategy_for_thermal_vector(
+    vector: Mapping[str, object],
+) -> StrategyId | None:
+    """Match an exact canonical thermal vector to one preference strategy."""
+
+    values = tuple(vector.get(device) for device in ("janela", "ar", "ventilador"))
+    if any(type(value) is not int or value not in (0, 1) for value in values):
+        return None
+    observed = cast(tuple[Binary, Binary, Binary], values)
+    for strategy_id, candidate in _THERMAL_MATCH_VECTORS.items():
+        if observed == candidate:
+            return strategy_id
+    return None
+
+
+def _thermal_actions(state: RoomState) -> tuple[ActionName, ...]:
+    """List thermal strategies once each, in canonical order.
+
+    ``manter`` e a estratégia nomeada do vetor atual são leituras distintas do
+    mesmo estado e ambas permanecem na lista; somente estratégias nomeadas com
+    o mesmo vetor seriam duplicatas.
+    """
+
+    actions: list[ActionName] = []
+    seen_vectors: set[tuple[object, object, object]] = set()
+    for strategy_id in _THERMAL_STRATEGIES:
+        vector = _thermal_vector(strategy_id, state["dispositivos"])
+        if strategy_id != "manter":
+            if vector in seen_vectors:
+                continue
+            seen_vectors.add(vector)
+        actions.append(cast(ActionName, strategy_id))
+    return tuple(actions)
+
+
+def _devices_after_action(
+    action: ActionName,
+    state: RoomState,
+    objective: DecisionObjective,
+) -> dict[str, object]:
+    """Project the device vector after the same plan used by a decision."""
+
+    final_devices = cast(
+        dict[str, object],
+        deepcopy(dict(state["dispositivos"])),
+    )
+    plan = _build_decision_plan(
+        action,
+        read_sensors(state),
+        state["dispositivos"],
+        objective=objective,
+        mode="cognitivo",
+    )
+    for step in plan:
+        final_devices[step["dispositivo"]] = step["comando"]
+    return final_devices
+
+
+def _thermal_forecast(
+    state: RoomState,
+    devices: Mapping[str, object],
+) -> tuple[float, float, float]:
+    """Forecast three hours with the candidate vector held constant."""
+
+    temperature = state["temperatura_interna"]
+    comfort_values: list[float] = []
+    first_temperature = temperature
+    for hour in range(THERMAL_HORIZON_HOURS):
+        temperature = advance_physics(
+            temperature,
+            state["temperatura_externa"],
+            devices.get("janela") == 1,
+            devices.get("ventilador") == 1,
+            devices.get("ar") == 1,
+        )
+        if hour == 0:
+            first_temperature = temperature
+        comfort_values.append(
+            calculate_comfort(_perceived_temperature(temperature, devices))
+        )
+    mean_comfort = round(sum(comfort_values) / len(comfort_values), 2)
+    return first_temperature, temperature, mean_comfort
+
+
+def _thermal_switch_penalty(
+    current: Mapping[str, object],
+    final: Mapping[str, object],
+) -> float:
+    changes = sum(
+        current.get(device) != final.get(device)
+        for device in ("janela", "ar", "ventilador")
+    )
+    return round(changes * THERMAL_SWITCH_PENALTY, 2)
+
+
+def _perceived_temperature(
+    projected_temperature: float,
+    devices: Mapping[str, object],
+) -> float:
+    """Apply the perceived relief of airflow without touching simulated physics."""
+
+    cooling = 0.0
+    if devices.get("ventilador") == 1:
+        cooling += PERCEIVED_AIRFLOW_COOLING_C
+        if devices.get("janela") == 1:
+            cooling += PERCEIVED_EXCHANGE_COOLING_C
+    return projected_temperature - cooling
+
+
 def _alternative_comfort(
     action: ActionName,
     objective: DecisionObjective,
     state: RoomState,
 ) -> float:
-    """Retorna o conforto binário da ação para o objetivo selecionado."""
+    """Score the candidate against its objective and projected temperature."""
 
-    if objective == "seguranca":
-        if action == "fechar":
-            return 1.0
-        if state["temperatura_interna"] > TEMP_HOT_LIMIT_C:
-            return 1.0 if action in {"ventilar", "resfriar"} else 0.0
-        return 0.0
+    canonical_action = _normalise_action(action)
     if objective == "umidade":
-        return 1.0 if action == "umidificar" else 0.0
-    if objective == "termico":
-        if state["temperatura_interna"] < TEMP_COLD_LIMIT_C:
-            return 1.0 if action == "fechar" else 0.0
-        return 1.0 if action in {"ventilar", "resfriar"} else 0.0
+        return 1.0 if canonical_action == "umidificar" else 0.0
     if objective == "iluminacao":
-        return 1.0 if action == "iluminar" else 0.0
-    return 1.0 if action == "manter" else 0.0
+        return 1.0 if canonical_action == "iluminar" else 0.0
+    if objective == "seguranca":
+        return 1.0 if canonical_action == "fechar" else 0.0
+    if objective == "manutencao":
+        return 1.0 if canonical_action == "manter" else 0.0
+
+    devices = _devices_after_action(canonical_action, state, objective)
+    predicted_temperature = advance_physics(
+        state["temperatura_interna"],
+        state["temperatura_externa"],
+        devices.get("janela") == 1,
+        devices.get("ventilador") == 1,
+        devices.get("ar") == 1,
+    )
+    return calculate_comfort(
+        _perceived_temperature(predicted_temperature, devices)
+    )
 
 
 def _alternative_block_reason(
     action: ActionName,
     state: RoomState,
+    objective: DecisionObjective,
 ) -> str | None:
     """Explica por que uma alternativa não pode ser escolhida no ciclo."""
 
+    canonical_action = _normalise_action(action)
     readings = read_sensors(state)
-    devices = state["dispositivos"]
-    reasons: list[str] = []
-
-    if action == "ventilar":
-        if readings["chuva"] == 1:
-            reasons.append("chuva detectada: abertura da janela bloqueada")
-        if readings["presenca_externa"] == 1:
-            reasons.append(
-                "presença externa detectada: abertura da janela bloqueada"
-            )
-        if devices["ar"] == 1:
-            reasons.append(
-                "intertravamento: ar ligado impede a abertura da janela"
-            )
-        if (
-            readings["temperatura_interna"] > TEMP_HOT_LIMIT_C
-            and state["ultima_acao_confirmada"] == "ventilar"
-        ):
-            reasons.append(
-                "escalada térmica: ventilação anterior confirmada sem reduzir o calor"
-            )
-    elif action == "manter":
-        if (
-            devices["janela"] == 1
-            and (readings["chuva"] == 1 or readings["presenca_externa"] == 1)
-        ):
-            reasons.append(
-                "segurança: manter a janela aberta viola a proteção do quarto"
-            )
-        if devices["janela"] == 1 and devices["ar"] == 1:
-            reasons.append(
-                "intertravamento: janela aberta e ar ligado são incompatíveis"
-            )
-
-    return "; ".join(reasons) if reasons else None
-
-
-def _alternative_change_count(action: ActionName, state: RoomState) -> int:
-    """Conta as mudanças físicas necessárias para o plano da alternativa."""
-
-    if action == "manter":
-        plan = _build_maintenance_plan(
-            read_sensors(state),
-            state["dispositivos"],
-        )
-        return sum(step["status"] == "pendente" for step in plan)
-    return sum(
-        step["status"] == "pendente"
-        for step in build_plan(action, state["dispositivos"])
+    devices: dict[str, object] = deepcopy(dict(state["dispositivos"]))
+    invalid_open_window = devices["janela"] == 1 and (
+        readings["chuva"] == 1
+        or readings["presenca_externa"] == 1
+        or devices["ar"] == 1
     )
+    if invalid_open_window and canonical_action != "fechar":
+        return "estado recebido inseguro: é necessário fechar a janela primeiro"
+    if objective == "termico" and canonical_action in _THERMAL_STRATEGIES:
+        temperature = readings["temperatura_interna"]
+        thermal_floor = (
+            COGNITIVE_CLIMATE_OFF_C
+            if devices.get("ar") == 1
+            else TEMP_HOT_LIMIT_C
+        )
+        if temperature > thermal_floor:
+            final_devices = _devices_after_action(canonical_action, state, objective)
+            projected_temperature, horizon_temperature, _ = _thermal_forecast(
+                state, final_devices
+            )
+            if projected_temperature >= temperature:
+                context = build_learning_context(state)
+                cooling_aversion = any(
+                    _preference_for(state, context, cooling, "termico") < 0
+                    for cooling in ("resfriamento", "resfriamento_assistido")
+                )
+                chosen_preference = _preference_for(
+                    state, context, canonical_action, "termico"
+                )
+                learned_tradeoff = (
+                    final_devices["ar"] == 0
+                    and (cooling_aversion or chosen_preference > 0)
+                )
+                if not learned_tradeoff:
+                    if (
+                        final_devices["janela"] == 1
+                        and readings["temperatura_externa"] >= temperature
+                    ):
+                        return "o ar externo está tão quente quanto o quarto; abrir a janela aumentaria o calor"
+                    return "a estratégia não reduz a temperatura do quarto neste ciclo"
+                if horizon_temperature > LEARNED_HEAT_CEILING_C:
+                    return (
+                        "a temperatura prevista em três horas excede "
+                        "o limite de tolerância térmica de 32 °C"
+                    )
+    if canonical_action in {"ventilacao_natural", "ventilacao_assistida"}:
+        if readings["chuva"] == 1:
+            return "chuva detectada: abertura da janela bloqueada"
+        if readings["presenca_externa"] == 1:
+            return "presença externa detectada: abertura da janela bloqueada"
+    if canonical_action == "iluminar" and not _lighting_required(readings):
+        return "iluminação não requerida pelo estado atual"
+    if canonical_action == "manter":
+        if devices["janela"] == 1 and readings["chuva"] == 1:
+            return "segurança: manter a janela aberta sob chuva é bloqueado"
+        if devices["janela"] == 1 and readings["presenca_externa"] == 1:
+            return "segurança: manter a janela aberta com presença externa é bloqueado"
+        if devices["janela"] == 1 and devices["ar"] == 1:
+            return "intertravamento: janela aberta e ar ligado são incompatíveis"
+    for device, command in _PLAN_STEPS[canonical_action]:
+        reason: str | None = None
+        if device == "janela" and command == 1:
+            if readings["chuva"] == 1:
+                reason = "chuva detectada: abertura da janela bloqueada"
+            elif readings["presenca_externa"] == 1:
+                reason = "presença externa detectada: abertura da janela bloqueada"
+            elif devices.get("ar") == 1:
+                reason = "intertravamento: ar ligado impede a abertura da janela"
+        elif device == "ar" and command == 1 and devices.get("janela") == 1:
+            reason = "intertravamento: ar ligado com janela aberta é bloqueado"
+        elif (
+            device == "umidificador"
+            and command == 1
+            and readings["umidade"] >= MAX_HUMIDITY_PCT
+        ):
+            reason = "saturação: umidificador bloqueado com umidade em 100%"
+        if reason is not None:
+            return reason
+        devices[device] = command
+    return None
 
 
 def _select_cognitive_alternative(
@@ -1068,31 +1457,24 @@ def _select_cognitive_alternative(
     if not eligible:
         raise RuntimeError("Nenhuma alternativa cognitiva elegível")
 
-    winner = eligible[0]
-    winner_score = winner[score_field]
-    for current in eligible[1:]:
-        current_score = current[score_field]
-        if current_score > winner_score + _UTILITY_EPSILON:
-            winner = current
-            winner_score = current_score
-        elif (
-            abs(current_score - winner_score)
-            <= _UTILITY_EPSILON + 1e-12
-            and _cognitive_tie_key(
-                current["acao"], state
-            )
-            < _cognitive_tie_key(winner["acao"], state)
-        ):
-            winner = current
-            winner_score = current_score
-    return winner
+    def order_key(alternative: DecisionAlternative) -> tuple[float, float, int, int]:
+        score = alternative[score_field]
+        comfort = alternative.get("conforto")
+        cost = alternative.get("custo")
+        if score is None or comfort is None or cost is None:
+            raise RuntimeError("Alternativa elegível sem pontuação normativa")
+        strategy_id = _alternative_strategy_id(alternative)
+        return (-score, -comfort, cost, _ACTION_ORDER[strategy_id])
+
+    _ = state
+    return min(eligible, key=order_key)
 
 
 def evaluate_alternatives(state: RoomState) -> list[DecisionAlternative]:
     """Avalia somente as alternativas do objetivo prioritário atual.
 
     A avaliação é pura: não executa planos, altera dispositivos ou consulta a
-    temperatura externa. A preferência é lida da memória contextual do estado.
+    temperatura externa. A preferência é lida pelo objetivo e strategy_id.
     """
 
     actions, objective = _cognitive_actions(state)
@@ -1103,32 +1485,72 @@ def _evaluate_objective_alternatives(
     state: RoomState,
     actions: Iterable[ActionName],
     objective: DecisionObjective,
+    *,
+    compare_preferences: bool = True,
 ) -> list[DecisionAlternative]:
     """Aplica a mesma utilidade e aprendizagem a um objetivo independente."""
 
+    action_list = tuple(actions)
     context = build_learning_context(state)
     alternatives: list[DecisionAlternative] = []
-    for action in actions:
-        blocked_reason = _alternative_block_reason(action, state)
+    for action in action_list:
+        canonical_action = _normalise_action(action)
+        blocked_reason = _alternative_block_reason(
+            canonical_action, state, objective
+        )
         eligible = blocked_reason is None
         corrections = (
-            _allowed_corrections(action)
+            _allowed_corrections(canonical_action)
             if eligible and objective != "seguranca"
             else []
         )
-        comfort = _alternative_comfort(action, objective, state)
-        economy = _ACTION_ECONOMY[action]
-        preference = _preference_for(state, context, action)
-        base_score = calculate_utility(comfort, economy, 0)
-        total_score = round(base_score + preference, 2)
-        utility = (
-            total_score
-            if eligible
-            else None
-        )
+        preference = 0
+        comfort: float | None = None
+        cost: int | None = None
+        economy: float | None = None
+        base_score: float | None = None
+        total_score: float | None = None
+        utility: float | None = None
+        preference_adjustment = 0.0
+        direct_preference = 0
+        first_temperature: float | None = None
+        horizon_temperature: float | None = None
+        horizon_comfort: float | None = None
+        switch_penalty = 0.0
+        if eligible:
+            final_devices = _devices_after_action(canonical_action, state, objective)
+            direct_preference = _preference_for(
+                state, context, canonical_action, objective
+            )
+            preference = (
+                _effective_thermal_preference(
+                    state, context, canonical_action, final_devices
+                )
+                if objective == "termico" and canonical_action in _THERMAL_STRATEGIES
+                else direct_preference
+            )
+            comfort = _alternative_comfort(canonical_action, objective, state)
+            cost = calculate_cost(final_devices)
+            economy = calculate_economy(cost)
+            if objective == "termico" and canonical_action in _THERMAL_STRATEGIES:
+                first_temperature, horizon_temperature, horizon_comfort = (
+                    _thermal_forecast(state, final_devices)
+                )
+                switch_penalty = _thermal_switch_penalty(
+                    state["dispositivos"], final_devices
+                )
+                base_score = (
+                    _calculate_base_score(horizon_comfort, economy) - switch_penalty
+                )
+            else:
+                base_score = _calculate_base_score(comfort, economy)
+            preference_adjustment = calculate_preference_adjustment(preference)
+            total_score = round(base_score + preference_adjustment, 2)
+            utility = total_score
         alternatives.append(
             {
-                "acao": action,
+                "acao": cast(ActionName, _legacy_action(canonical_action)),
+                "strategy_id": canonical_action,
                 "pontuacao_base": base_score,
                 "preferencia_contextual": preference,
                 "pontuacao_total": total_score,
@@ -1138,79 +1560,193 @@ def _evaluate_objective_alternatives(
                 "correcoes_permitidas": corrections,
                 "conforto": comfort,
                 "economia": economy,
-                "preferencia": preference,
+                "custo": cost,
+                "preferencia": preference_adjustment,
                 "utilidade": utility,
+                "temperatura_projetada": first_temperature,
+                "temperatura_em_tres_horas": horizon_temperature,
+                "conforto_horizonte": horizon_comfort,
+                "penalidade_troca": switch_penalty,
+                "preferencia_estrategia": direct_preference,
+                "ajuste_familia_ar": preference - direct_preference,
             }
         )
 
+    if not any(alternative["elegivel"] for alternative in alternatives):
+        return alternatives
+    if not compare_preferences:
+        return alternatives
+
+    baseline_state = cast(RoomState, {**state, "preferencias": {}})
+    baseline_alternatives = _evaluate_objective_alternatives(
+        baseline_state,
+        action_list,
+        objective,
+        compare_preferences=False,
+    )
     winner = _select_cognitive_alternative(alternatives, state, "pontuacao_total")
-    baseline_winner = _select_cognitive_alternative(
-        alternatives,
-        state,
-        "pontuacao_base",
+    baseline_eligible = [
+        item for item in baseline_alternatives if item["elegivel"]
+    ]
+    baseline_winner = (
+        _select_cognitive_alternative(
+            baseline_alternatives,
+            baseline_state,
+            "pontuacao_total",
+        )
+        if baseline_eligible
+        else None
     )
     winner_changed_without_preferences = (
-        winner["acao"] != baseline_winner["acao"]
+        baseline_winner is None
+        or _alternative_strategy_id(winner) != _alternative_strategy_id(baseline_winner)
     )
+    baseline_by_strategy = {
+        _alternative_strategy_id(item): item for item in baseline_alternatives
+    }
     for alternative in alternatives:
+        baseline_alternative = baseline_by_strategy[
+            _alternative_strategy_id(alternative)
+        ]
         alternative["influenciada"] = (
             alternative["preferencia_contextual"] != 0
+            or alternative["elegivel"] != baseline_alternative["elegivel"]
             or (
                 winner_changed_without_preferences
-                and alternative["acao"] == winner["acao"]
+                and _alternative_strategy_id(alternative)
+                == _alternative_strategy_id(winner)
             )
         )
     return alternatives
 
 
-def _cognitive_tie_key(
-    action: ActionName,
-    state: RoomState,
-) -> tuple[int, int, int, int]:
-    """Produz a chave lexicográfica do desempate cognitivo."""
+def _alternative_strategy_id(alternative: DecisionAlternative) -> str:
+    """Read a canonical strategy identifier with support for old alternatives."""
 
-    return (
-        0 if action == "manter" else 1,
-        _ACTION_COST[action],
-        _alternative_change_count(action, state),
-        _ACTION_ORDER[action],
+    value = alternative.get("strategy_id")
+    if isinstance(value, str):
+        return _normalise_action(value)
+    return _normalise_action(alternative["acao"])
+
+
+def _legacy_action(action: ActionName | str) -> str:
+    """Translate canonical thermal identifiers for the legacy `acao` field."""
+
+    canonical_action = _normalise_action(action)
+    return _LEGACY_THERMAL_ACTIONS.get(canonical_action, canonical_action)
+
+
+def _strategy_explanation_label(strategy: str, state: RoomState) -> str:
+    if strategy == "manter":
+        if state["dispositivos"]["ar"] == 1:
+            return "manter o ar-condicionado ligado"
+        return "manter os dispositivos como estão"
+    return {
+        "ventilacao_natural": "ventilação natural",
+        "ventilacao_assistida": "ventilação com ventilador",
+        "circulacao_interna": "circulação interna",
+        "resfriamento": "resfriamento com ar-condicionado",
+        "resfriamento_assistido": "resfriamento com ar e ventilador",
+        "umidificacao": "umidificação",
+        "iluminacao": "iluminação",
+    }.get(strategy, strategy)
+
+
+def _learning_influence_message(
+    state: RoomState,
+    winner: DecisionAlternative,
+    baseline_winner: DecisionAlternative,
+    alternatives: list[DecisionAlternative],
+    baseline_alternatives: list[DecisionAlternative],
+) -> tuple[bool, str]:
+    """Explain the causal effect of learned preferences on the primary choice."""
+
+    chosen = _alternative_strategy_id(winner)
+    baseline = _alternative_strategy_id(baseline_winner)
+    chosen_label = _strategy_explanation_label(chosen, state)
+    baseline_label = _strategy_explanation_label(baseline, state)
+    baseline_by_strategy = {
+        _alternative_strategy_id(item): item for item in baseline_alternatives
+    }
+    actual_by_strategy = {
+        _alternative_strategy_id(item): item for item in alternatives
+    }
+    eligibility_changed = any(
+        item["elegivel"] != baseline_by_strategy[strategy]["elegivel"]
+        for strategy, item in actual_by_strategy.items()
     )
+    applicable_preference = any(
+        item["elegivel"] and item["preferencia_contextual"] != 0
+        for item in alternatives
+    )
+    if chosen != baseline:
+        if not baseline_by_strategy[chosen]["elegivel"]:
+            context = build_learning_context(state)
+            cooling_rejected = any(
+                _preference_for(state, context, cooling, "termico") < 0
+                for cooling in ("resfriamento", "resfriamento_assistido")
+            )
+            source = (
+                "a rejeição anterior ao ar-condicionado"
+                if cooling_rejected and winner["preferencia_contextual"] == 0
+                else "a preferência aprendida"
+            )
+            return (
+                True,
+                f"Sem preferências, a escolha seria {baseline_label}; {source} "
+                f"liberou a opção de {chosen_label} e alterou a escolha.",
+            )
+        competitor = actual_by_strategy[baseline]
+        if (
+            winner["preferencia_contextual"] == 0
+            and competitor["preferencia_contextual"] < 0
+        ):
+            return (
+                True,
+                f"Sem preferências, a escolha seria {baseline_label}; a penalização "
+                f"aprendida de {baseline_label} alterou a escolha para {chosen_label}.",
+            )
+        return (
+            True,
+            f"Sem preferências, a escolha seria {baseline_label}; a preferência "
+            f"aprendida alterou a escolha para {chosen_label}.",
+        )
+    if applicable_preference or eligibility_changed:
+        return (
+            True,
+            f"Sem preferências, {chosen_label} também venceria; a preferência aprendida "
+            "foi considerada, mas não alterou a vencedora.",
+        )
+    return False, "Nenhuma preferência aprendida influenciou esta escolha."
 
 
 def _cognitive_decision_reason(
     objective: DecisionObjective,
     winner: DecisionAlternative,
-    baseline_winner: DecisionAlternative,
 ) -> str:
     """Explica o efeito causal da preferência sobre a alternativa vencedora."""
 
-    action = winner["acao"]
-    baseline_action = baseline_winner["acao"]
+    action = _legacy_action(_alternative_strategy_id(winner))
     preference = winner["preferencia_contextual"]
     score = winner["pontuacao_total"]
     base_score = winner["pontuacao_base"]
-
-    if action != baseline_action:
-        causal_reason = (
-            f"Sem preferências contextuais, a vencedora seria "
-            f"{baseline_action}; a preferência contextual alterou a escolha "
-            f"para {action}."
-        )
-    elif preference != 0:
-        causal_reason = (
-            f"Sem preferências contextuais, {action} também venceria; a "
-            "preferência contextual foi considerada, mas não alterou a "
-            "vencedora."
-        )
-    else:
-        causal_reason = (
-            f"Sem preferências contextuais, {action} também venceria; não "
-            "houve influência contextual na escolha."
-        )
+    causal_reason = winner.get(
+        "motivo_influencia", "Nenhuma preferência aprendida influenciou esta escolha."
+    )
+    forecast = winner.get("temperatura_em_tres_horas")
+    first = winner.get("temperatura_projetada")
+    forecast_reason = (
+        f" Temperatura física prevista: {first:.1f} °C no próximo ciclo e "
+        f"{forecast:.1f} °C em três ciclos; penalidade por troca "
+        f"{winner.get('penalidade_troca', 0.0):.2f}."
+        if isinstance(first, (int, float)) and isinstance(forecast, (int, float))
+        else ""
+    )
     return (
         f"Objetivo {objective}: ação {action} escolhida com pontuação-base "
         f"{base_score:.2f}, preferência contextual {preference:+d} e "
         f"pontuação total {score:.2f}. {causal_reason}"
+        f"{forecast_reason}"
     )
 
 
@@ -1223,7 +1759,7 @@ def choose_cognitive_action(state: RoomState) -> ActionName:
         state,
         "pontuacao_total",
     )
-    return winner["acao"]
+    return cast(ActionName, _alternative_strategy_id(winner))
 
 
 def _preventive_commands(
@@ -1273,6 +1809,8 @@ def _reactive_rule(
         security_reasons.append("chuva detectada")
     if readings["presenca_externa"] == 1:
         security_reasons.append("presença externa detectada")
+    if devices["janela"] == 1 and devices["ar"] == 1:
+        security_reasons.append("intertravamento entre janela aberta e ar ligado")
     if devices["janela"] == 1 and security_reasons:
         details = "; ".join(security_reasons)
         return (
@@ -1409,6 +1947,8 @@ def _build_plan_steps(
 def _build_maintenance_plan(
     readings: SensorReadings,
     device_state: Mapping[str, object],
+    *,
+    mode: Mode = "reativo",
 ) -> list[PlanStep]:
     """Monta desligamentos de segurança, iluminação e climatização."""
 
@@ -1420,7 +1960,9 @@ def _build_maintenance_plan(
 
     if (
         readings["presenca_interna"] == 1
-        and readings["temperatura_interna"] <= TEMP_CLIMATE_OFF_C
+        and readings["temperatura_interna"] <= (
+            COGNITIVE_CLIMATE_OFF_C if mode == "cognitivo" else TEMP_CLIMATE_OFF_C
+        )
     ):
         commands.extend(
             (device, 0)
@@ -1434,6 +1976,9 @@ def _build_decision_plan(
     action: ActionName | Iterable[ActionName],
     readings: SensorReadings,
     device_state: Mapping[str, object],
+    *,
+    objective: DecisionObjective | None = None,
+    mode: Mode = "reativo",
 ) -> list[PlanStep]:
     """Monta o plano da decisão com as salvaguardas preventivas da política."""
 
@@ -1452,9 +1997,31 @@ def _build_decision_plan(
         ):
             raise ValueError("O plano contém ações incompatíveis no mesmo atuador.")
         command_by_device.update(action_commands)
-    for step in _build_maintenance_plan(readings, device_state):
+    preserves_thermal_auxiliaries = objective == "termico" or any(
+        selected_action in _THERMAL_STRATEGIES
+        and selected_action != "manter"
+        for selected_action in actions
+    )
+    for step in _build_maintenance_plan(readings, device_state, mode=mode):
+        if (
+            preserves_thermal_auxiliaries
+            and readings["presenca_interna"] == 1
+            and readings["dormir"] == 0
+            and step["dispositivo"] == "lampada"
+        ):
+            continue
         command_by_device[step["dispositivo"]] = step["comando"]
-    return _build_plan_steps(command_by_device.items(), device_state)
+    ordered_commands = list(command_by_device.items())
+    window_needs_closing = device_state.get("janela") == 1 and (
+        readings["chuva"] == 1
+        or readings["presenca_externa"] == 1
+        or device_state.get("ar") == 1
+    )
+    if window_needs_closing and command_by_device.get("janela") == 0:
+        ordered_commands.insert(
+            0, ordered_commands.pop(ordered_commands.index(("janela", 0)))
+        )
+    return _build_plan_steps(ordered_commands, device_state)
 
 
 def _compatible_cycle_actions(
@@ -1475,8 +2042,15 @@ def _compatible_cycle_actions(
     groups: list[tuple[DecisionObjective, tuple[ActionName, ...]]] = []
     if readings["umidade"] < 40:
         groups.append(("umidade", ("umidificar", "manter")))
-    if readings["temperatura_interna"] > TEMP_HOT_LIMIT_C:
-        groups.append(("termico", ("resfriar", "ventilar", "manter")))
+    if readings["temperatura_interna"] > (
+        COGNITIVE_COOL_ON_C if mode == "cognitivo" else TEMP_HOT_LIMIT_C
+    ):
+        thermal_candidates: tuple[ActionName, ...] = (
+            _thermal_actions(state)
+            if mode == "cognitivo"
+            else ("resfriamento", "ventilacao_assistida", "manter")
+        )
+        groups.append(("termico", thermal_candidates))
     elif (
         readings["temperatura_interna"] < TEMP_COLD_LIMIT_C
         and _cold_action_pending(devices)
@@ -1504,9 +2078,12 @@ def _compatible_cycle_actions(
             alternatives = _evaluate_objective_alternatives(
                 evaluated_state, compatible, goal
             )
+            if not any(alternative["elegivel"] for alternative in alternatives):
+                continue
             action = _select_cognitive_alternative(
                 alternatives, evaluated_state, "pontuacao_total"
-            )["acao"]
+            )
+            action = cast(ActionName, _alternative_strategy_id(action))
         else:
             action = candidates[0] if candidates[0] in compatible else "manter"
         if action != "manter" and action not in actions:
@@ -1528,9 +2105,11 @@ def make_decision(state: RoomState, mode: Mode | str = "reativo") -> Decision:
 
     if selected_mode == "reativo":
         action, objective, reason = _reactive_rule(state)
+        action = _normalise_action(action)
         alternatives: list[DecisionAlternative] = [
             {
-                "acao": action,
+                "acao": cast(ActionName, _legacy_action(action)),
+                "strategy_id": action,
                 "pontuacao_base": 0.0,
                 "preferencia_contextual": 0,
                 "pontuacao_total": 0.0,
@@ -1546,25 +2125,58 @@ def make_decision(state: RoomState, mode: Mode | str = "reativo") -> Decision:
         ]
     else:
         alternatives = evaluate_alternatives(state)
-        action = _select_cognitive_alternative(
+        winner = _select_cognitive_alternative(
             alternatives,
             state,
             "pontuacao_total",
-        )["acao"]
+        )
+        action = cast(ActionName, _alternative_strategy_id(winner))
         _, objective = _cognitive_actions(state)
-        winner = next(
-            alternative
-            for alternative in alternatives
-            if alternative["acao"] == action
-        )
+        baseline_state = cast(RoomState, {**state, "preferencias": {}})
+        baseline_alternatives = evaluate_alternatives(baseline_state)
         baseline_winner = _select_cognitive_alternative(
-            alternatives,
-            state,
-            "pontuacao_base",
+            baseline_alternatives,
+            baseline_state,
+            "pontuacao_total",
         )
-        reason = _cognitive_decision_reason(objective, winner, baseline_winner)
+        influenced, influence_message = _learning_influence_message(
+            state, winner, baseline_winner, alternatives, baseline_alternatives
+        )
+        winner["influenciada"] = influenced
+        winner["motivo_influencia"] = influence_message
 
     actions = _compatible_cycle_actions(state, action, objective, selected_mode)
+    if selected_mode == "cognitivo":
+        baseline_action = cast(ActionName, _alternative_strategy_id(baseline_winner))
+        baseline_actions = _compatible_cycle_actions(
+            baseline_state, baseline_action, objective, "cognitivo"
+        )
+        if actions[1:] != baseline_actions[1:]:
+            if action == baseline_action:
+                secondary_message = (
+                    "A preferência aprendida alterou uma ação adicional do ciclo; "
+                    "a estratégia principal permaneceu a mesma."
+                )
+                winner["motivo_influencia"] = (
+                    f"{winner['motivo_influencia']} {secondary_message}"
+                    if winner["influenciada"]
+                    else secondary_message
+                )
+            else:
+                winner["motivo_influencia"] += (
+                    " A composição das ações adicionais do ciclo também mudou."
+                )
+            winner["influenciada"] = True
+        reason = _cognitive_decision_reason(objective, winner)
+        if (
+            objective == "termico"
+            and action == "manter"
+            and state["dispositivos"]["ar"] == 1
+            and readings["temperatura_interna"] <= COGNITIVE_CLIMATE_OFF_C
+        ):
+            reason += " O plano desliga o ar-condicionado ao entrar na faixa de conforto."
+    legacy_action = cast(ActionName, _legacy_action(action))
+    legacy_actions = [cast(ActionName, _legacy_action(item)) for item in actions]
     decision: Decision = {
         "decisao_id": uuid4().hex,
         "identidade": (
@@ -1574,12 +2186,19 @@ def make_decision(state: RoomState, mode: Mode | str = "reativo") -> Decision:
         ),
         "modo": selected_mode,
         "objetivo": objective,
-        "acao": action,
-        "acoes": actions,
+        "acao": legacy_action,
+        "strategy_id": action,
+        "acoes": legacy_actions,
         "status": "prevista",
         "motivo": reason,
         "alternativas": alternatives,
-        "plano": _build_decision_plan(actions, readings, state["dispositivos"]),
+        "plano": _build_decision_plan(
+            actions,
+            readings,
+            state["dispositivos"],
+            objective=objective,
+            mode=selected_mode,
+        ),
         "correcoes_permitidas": (
             _allowed_corrections(action)
             if selected_mode == "cognitivo" and objective != "seguranca"
@@ -1743,7 +2362,7 @@ def validate_cycle_request(payload: object) -> CycleRequest:
 def confirm_step(state: RoomState, step: PlanStep) -> DeviceConfirmation:
     """Apply one local device command and require its physical confirmation."""
 
-    _ensure_window_opening_is_safe(
+    _ensure_device_command_is_safe(
         state,
         step["dispositivo"],
         step["comando"],
@@ -1945,6 +2564,243 @@ def execute_manual(
     return executed_steps
 
 
+def _empty_run_summary(run_id: str) -> RunSummary:
+    return {
+        "run_id": run_id,
+        "ciclos": 0,
+        "custo_energetico_total": 0.0,
+        "custo_energetico_medio": None,
+        "conforto_acumulado": 0.0,
+        "conforto_medio": None,
+        "ciclos_seguros": 0,
+        "prevencoes": 0,
+        "incidentes": 0,
+        "aceitacoes": 0,
+        "correcoes": 0,
+        "feedbacks_observados": 0,
+        "satisfacao_acumulada": 0.0,
+        "satisfacao_observada": None,
+    }
+
+
+def _update_run_summary_for_cycle(state: RoomState, metric: CycleMetrics) -> None:
+    summary = deepcopy(state["resumo"])
+    if summary["run_id"] != metric["run_id"]:
+        summary = _empty_run_summary(metric["run_id"])
+    cycle_count = summary["ciclos"] + 1
+    energy_total = summary["custo_energetico_total"] + metric["custo_energetico"]
+    comfort_total = summary["conforto_acumulado"] + metric["conforto"]
+    feedback = metric["feedback"]
+    if feedback is not None:
+        summary["feedbacks_observados"] += 1
+        summary["satisfacao_acumulada"] += 1.0 if feedback == "aceitar" else 0.0
+        summary["aceitacoes"] += feedback == "aceitar"
+        summary["correcoes"] += feedback == "corrigir"
+    feedback_count = summary["feedbacks_observados"]
+    state["resumo"] = {
+        **summary,
+        "ciclos": cycle_count,
+        "custo_energetico_total": energy_total,
+        "custo_energetico_medio": round(energy_total / cycle_count, 2),
+        "conforto_acumulado": comfort_total,
+        "conforto_medio": round(comfort_total / cycle_count, 2),
+        "ciclos_seguros": summary["ciclos_seguros"] + (metric["seguranca"] == "seguro"),
+        "prevencoes": summary["prevencoes"] + (metric["seguranca"] == "prevencao"),
+        "incidentes": summary["incidentes"] + len(metric["incidentes"]),
+        "satisfacao_observada": (
+            round(summary["satisfacao_acumulada"] / feedback_count, 2)
+            if feedback_count
+            else None
+        ),
+    }
+
+
+def _update_run_summary_for_feedback(
+    state: RoomState,
+    feedback_type: FeedbackType,
+) -> None:
+    summary = deepcopy(state["resumo"])
+    feedback_count = summary["feedbacks_observados"] + 1
+    satisfaction_total = summary["satisfacao_acumulada"] + (
+        1.0 if feedback_type == "aceitar" else 0.0
+    )
+    state["resumo"] = {
+        **summary,
+        "aceitacoes": summary["aceitacoes"] + (feedback_type == "aceitar"),
+        "correcoes": summary["correcoes"] + (feedback_type == "corrigir"),
+        "feedbacks_observados": feedback_count,
+        "satisfacao_acumulada": satisfaction_total,
+        "satisfacao_observada": round(satisfaction_total / feedback_count, 2),
+    }
+
+
+def _refresh_run_summary(state: RoomState) -> None:
+    metrics = [
+        metric for metric in state["metricas"]
+        if metric["run_id"] == state["run_id"]
+    ]
+    feedback_scores = [
+        1.0 if metric["feedback"] == "aceitar" else 0.0
+        for metric in metrics
+        if metric["feedback"] is not None
+    ]
+    cycle_count = len(metrics)
+    energy_total = float(sum(metric["custo_energetico"] for metric in metrics))
+    comfort_total = sum(metric["conforto"] for metric in metrics)
+    satisfaction_total = sum(feedback_scores)
+    state["resumo"] = {
+        "run_id": state["run_id"],
+        "ciclos": cycle_count,
+        "custo_energetico_total": energy_total,
+        "custo_energetico_medio": (
+            round(energy_total / cycle_count, 2) if cycle_count else None
+        ),
+        "conforto_acumulado": comfort_total,
+        "conforto_medio": (
+            round(comfort_total / cycle_count, 2) if cycle_count else None
+        ),
+        "ciclos_seguros": sum(
+            metric["seguranca"] == "seguro" for metric in metrics
+        ),
+        "prevencoes": sum(
+            metric["seguranca"] == "prevencao" for metric in metrics
+        ),
+        "incidentes": sum(len(metric["incidentes"]) for metric in metrics),
+        "aceitacoes": sum(metric["feedback"] == "aceitar" for metric in metrics),
+        "correcoes": sum(metric["feedback"] == "corrigir" for metric in metrics),
+        "feedbacks_observados": len(feedback_scores),
+        "satisfacao_acumulada": satisfaction_total,
+        "satisfacao_observada": (
+            round(satisfaction_total / len(feedback_scores), 2)
+            if feedback_scores
+            else None
+        ),
+    }
+
+
+def _cycle_incidents(state: RoomState) -> list[str]:
+    devices = state["dispositivos"]
+    incidents: list[str] = []
+    if devices["janela"] == 1 and state["chuva"] == 1:
+        incidents.append("janela_aberta_com_chuva")
+    if devices["janela"] == 1 and state["presenca_externa"] == 1:
+        incidents.append("janela_aberta_com_presenca_externa")
+    if devices["janela"] == 1 and devices["ar"] == 1:
+        incidents.append("intertravamento_janela_ar")
+    return incidents
+
+
+def _materialize_cycle_metrics(
+    state: RoomState,
+    decision: Mapping[str, object],
+    previous_state: RoomState,
+) -> CycleMetrics:
+    strategy_value = decision.get("strategy_id")
+    if not isinstance(strategy_value, str):
+        raise RuntimeError("Confirmed decision has no strategy identifier.")
+    action_strategy_id = _normalise_action(strategy_value)
+    strategy_id = cast(StrategyId, _strategy_id(strategy_value))
+    alternatives_value = decision.get("alternativas")
+    alternatives = (
+        cast(list[Mapping[str, object]], alternatives_value)
+        if isinstance(alternatives_value, list)
+        else []
+    )
+    selected_alternative = next(
+        (
+            alternative
+            for alternative in alternatives
+            if (
+                isinstance(alternative.get("strategy_id"), str)
+                and _normalise_action(cast(str, alternative["strategy_id"]))
+                == action_strategy_id
+            )
+        ),
+        None,
+    )
+    adjustment_value = (
+        selected_alternative.get("preferencia")
+        if selected_alternative is not None
+        else 0.0
+    )
+    preference_adjustment = (
+        float(adjustment_value)
+        if isinstance(adjustment_value, (int, float))
+        and not isinstance(adjustment_value, bool)
+        else 0.0
+    )
+    blocked_reasons: list[str] = []
+    for alternative in alternatives:
+        reason = alternative.get("motivo_bloqueio")
+        if isinstance(reason, str) and reason not in blocked_reasons:
+            blocked_reasons.append(reason)
+
+    incidents = _cycle_incidents(state)
+    previous_devices = previous_state["dispositivos"]
+    was_unsafe = (
+        previous_devices["janela"] == 1
+        and (
+            previous_state["chuva"] == 1
+            or previous_state["presenca_externa"] == 1
+            or previous_devices["ar"] == 1
+        )
+    )
+    decision_prevented = decision.get("objetivo") == "seguranca"
+    prevented = bool(blocked_reasons) or decision_prevented or (
+        was_unsafe and not incidents
+    )
+    security: Literal["seguro", "prevencao", "incidente"]
+    if incidents:
+        security = "incidente"
+    elif prevented:
+        security = "prevencao"
+    else:
+        security = "seguro"
+
+    cost = calculate_cost(state["dispositivos"])
+    temperature = state["temperatura_interna"]
+    cycle_number = state["resumo"]["ciclos"] + 1
+    metric: CycleMetrics = {
+        "cycle_id": uuid5(
+            NAMESPACE_URL,
+            f"peas-cycle:{state['run_id']}:{cycle_number}",
+        ).hex,
+        "run_id": state["run_id"],
+        "numero_ciclo": cycle_number,
+        "temperatura_projetada": temperature,
+        "conforto": calculate_comfort(temperature),
+        "custo_energetico": float(cost),
+        "economia": calculate_economy(cost),
+        "ajuste_preferencia": preference_adjustment,
+        "strategy_id": strategy_id,
+        "seguranca": security,
+        "bloqueios": blocked_reasons,
+        "incidentes": incidents,
+        "feedback": None,
+    }
+    return metric
+
+
+def record_observed_feedback(
+    state: RoomState,
+    decision_id: str,
+    feedback_type: FeedbackType,
+) -> None:
+    if not state["metricas"]:
+        return
+    metric = state["metricas"][-1]
+    current_decision = state["decisao"]
+    if (
+        metric["run_id"] != state["run_id"]
+        or not isinstance(current_decision, Mapping)
+        or _decision_id(current_decision) != decision_id
+        or metric["feedback"] is not None
+    ):
+        return
+    metric["feedback"] = feedback_type
+    _update_run_summary_for_feedback(state, feedback_type)
+
+
 def run_cycle(
     request: CycleRequest | Mapping[str, object] | str | None = None,
     *,
@@ -2005,6 +2861,9 @@ def run_cycle(
         )
         selected_state["decisao_pendente"] = None
         _clear_confirmed_command_registry(selected_state)
+        metric = _materialize_cycle_metrics(selected_state, decision, snapshot)
+        selected_state["metricas"].append(metric)
+        _update_run_summary_for_cycle(selected_state, metric)
         append_trace_event(
             selected_state,
             "ciclo",
@@ -2050,6 +2909,76 @@ def validate_reset_request(payload: object = NO_BODY) -> ResetRequest:
 
     _request_body(payload, ())
     return {}
+
+
+def validate_trace_query_request(payload: object) -> TraceQueryRequest:
+    body = _request_body(payload, ("run_id", "cursor", "limit"))
+    run_id = _string_field(body["run_id"], "run_id")
+    if len(run_id) > 128:
+        _fail(INVALID_VALUE, "run_id excede o limite permitido.", ["run_id"])
+    cursor_value = body["cursor"]
+    cursor = (
+        None
+        if cursor_value is None
+        else _integer_field(cursor_value, "cursor", 0, 2**53 - 1)
+    )
+    limit = _integer_field(body["limit"], "limit", 1, MAX_TRACE_PAGE_LIMIT)
+    return {"run_id": run_id, "cursor": cursor, "limit": limit}
+
+
+def prune_trace(state: RoomState, through_order: int) -> int:
+    if type(through_order) is not int or through_order < 0:
+        _fail(INVALID_VALUE, "through_order deve ser um inteiro não negativo.", ["through_order"])
+    validate_trace(state)
+    old_watermark = state["pruned_before"]
+    removed = [
+        event for event in state["rastro"]
+        if event["ordem"] <= through_order
+    ]
+    if not removed:
+        return old_watermark
+    state["rastro"] = [
+        event for event in state["rastro"]
+        if event["ordem"] > through_order
+    ]
+    state["pruned_before"] = max(old_watermark, removed[-1]["ordem"])
+    validate_trace(state)
+    return state["pruned_before"]
+
+
+def query_trace(
+    payload: object,
+    *,
+    state: RoomState = estado_quarto,
+) -> dict[str, object]:
+    query = validate_trace_query_request(payload)
+    validate_trace(state)
+    if query["run_id"] != state["run_id"]:
+        _fail(RUN_NOT_FOUND, "A execução solicitada não existe.", ["run_id"])
+
+    watermark = state["pruned_before"]
+    cursor = query["cursor"]
+    if cursor is not None and cursor <= watermark:
+        _fail(
+            TRACE_CURSOR_PRUNED,
+            "O cursor solicitado já foi removido pela retenção do rastro.",
+            ["cursor"],
+        )
+    first_order = watermark + 1 if cursor is None else cursor
+    remaining = [
+        event for event in state["rastro"]
+        if event["ordem"] >= first_order
+    ]
+    limit = query["limit"]
+    page = remaining[:limit]
+    next_cursor = remaining[limit]["ordem"] if len(remaining) > limit else None
+    return {
+        "status": "sucesso",
+        "run_id": state["run_id"],
+        "events": deepcopy(page),
+        "next_cursor": next_cursor,
+        "pruned_before": watermark,
+    }
 
 
 def validate_manual_request(payload: object) -> ManualRequest:
@@ -2332,6 +3261,413 @@ def _query_binary(value: str | None, field: str) -> Binary:
     return cast(Binary, int(value))
 
 
+_LEGACY_IDENTITY_ID: Final[str] = "legacy-room"
+_PROTOCOL_STRATEGIES: Final[frozenset[str]] = frozenset(
+    {
+        "manter",
+        "ventilacao_natural",
+        "ventilacao_assistida",
+        "circulacao_interna",
+        "resfriamento",
+        "resfriamento_assistido",
+        "umidificacao",
+        "iluminacao",
+    }
+)
+
+
+def _legacy_protocol_id(value: object) -> str:
+    if isinstance(value, str):
+        try:
+            return protocol.validate_payload_hash(value)
+        except protocol.ProtocolValidationError:
+            return sha256(value.encode("utf-8")).hexdigest()
+    return sha256(protocol.canonical_json_bytes(value)).hexdigest()
+
+
+def _legacy_protocol_decision(
+    value: Mapping[str, object] | None,
+) -> protocol.DecisionSnapshot | None:
+    if value is None:
+        return None
+    raw_strategy = value.get("strategy_id")
+    if isinstance(raw_strategy, str) and raw_strategy in _PROTOCOL_STRATEGIES:
+        strategy = raw_strategy
+    else:
+        action = value.get("acao", "manter")
+        if not isinstance(action, str):
+            raise ValueError("Legacy decision action must be a string.")
+        strategy = _strategy_id(action)
+    if strategy not in _PROTOCOL_STRATEGIES:
+        raise ValueError("Legacy decision has an unsupported strategy.")
+    objective = value.get("objetivo", "manutencao")
+    mode = value.get("modo", "reativo")
+    status = value.get("status", "confirmada")
+    if objective not in {"seguranca", "umidade", "termico", "iluminacao", "manutencao"}:
+        raise ValueError("Legacy decision has an unsupported objective.")
+    if mode not in {"reativo", "cognitivo"}:
+        raise ValueError("Legacy decision has an unsupported mode.")
+    if status not in {"prevista", "confirmada", "invalidada"}:
+        raise ValueError("Legacy decision has an unsupported status.")
+    alternatives = value.get("alternativas", [])
+    plan = value.get("plano", [])
+    if not isinstance(alternatives, list) or not isinstance(plan, list):
+        raise ValueError("Legacy decision alternatives and plan must be lists.")
+    decision: dict[str, object] = {
+        "decisao_id": _legacy_protocol_id(value.get("decisao_id")),
+        "objetivo": cast(protocol.Objective, objective),
+        "strategy_id": cast(protocol.StrategyId, strategy),
+        "modo": cast(protocol.Mode, mode),
+        "status": cast(Literal["prevista", "confirmada", "invalidada"], status),
+        "influenciada": value.get("influenciada") is True,
+        "alternativas": cast(list[dict[str, object]], deepcopy(alternatives)),
+        "plano": cast(list[dict[str, object]], deepcopy(plan)),
+    }
+    context = value.get("contexto")
+    if isinstance(context, Mapping):
+        decision["contexto"] = deepcopy(dict(context))
+    corrections = value.get("correcoes_permitidas")
+    if not isinstance(corrections, list):
+        selected = next(
+            (
+                alternative
+                for alternative in alternatives
+                if isinstance(alternative, Mapping)
+                and alternative.get("strategy_id") == strategy
+            ),
+            None,
+        )
+        corrections = (
+            selected.get("correcoes_permitidas")
+            if isinstance(selected, Mapping)
+            else None
+        )
+    if isinstance(corrections, list):
+        decision["correcoes_permitidas"] = deepcopy(corrections)
+    return cast(protocol.DecisionSnapshot, decision)
+
+
+def _legacy_protocol_preferences(
+    state: RoomState,
+) -> list[protocol.PreferenceRecord]:
+    revision = state["revisao_estado"]
+    context = cast(
+        dict[str, str | int | float | bool],
+        dict(build_learning_context(state)),
+    )
+    records: list[protocol.PreferenceRecord] = []
+    for key, value in state["preferencias"].items():
+        if isinstance(key, str):
+            preference_key = json.loads(key)
+        else:
+            preference_key = key
+        if (
+            not isinstance(preference_key, (tuple, list))
+            or len(preference_key) != 2
+            or not isinstance(preference_key[0], str)
+            or not isinstance(preference_key[1], str)
+        ):
+            raise ValueError("Legacy preference key is invalid.")
+        objective, raw_strategy = preference_key
+        strategy = _strategy_id(raw_strategy)
+        if objective not in {
+            "seguranca",
+            "umidade",
+            "termico",
+            "iluminacao",
+            "manutencao",
+        }:
+            raise ValueError("Legacy preference objective is unsupported.")
+        if strategy not in _PROTOCOL_STRATEGIES:
+            raise ValueError("Legacy preference strategy is unsupported.")
+        if type(value) is not int or not -3 <= value <= 3:
+            raise ValueError("Legacy preference value must be between -3 and 3.")
+        records.append(
+            {
+                "objetivo": cast(protocol.Objective, objective),
+                "strategy_id": cast(protocol.StrategyId, strategy),
+                "valor": cast(protocol.PreferenceValue, value),
+                "updated_revision": revision,
+                "contexto_explicativo": context,
+            }
+        )
+    return records
+
+
+def _legacy_protocol_computation(
+    state: RoomState,
+) -> protocol.ComputationState:
+    physical_fields = (
+        "preset_atual",
+        "hora",
+        "temperatura_externa",
+        "temperatura_interna",
+        "umidade",
+        "luminosidade",
+        "chuva",
+        "presenca_interna",
+        "presenca_externa",
+        "dormir",
+    )
+    decision = _legacy_protocol_decision(
+        cast(Mapping[str, object] | None, state["decisao"])
+    )
+    episode = deepcopy(state["episodio_aberto"])
+    if episode is not None:
+        episode["episode_id"] = _legacy_protocol_id(episode["episode_id"])
+        episode["decisao_id"] = _legacy_protocol_id(episode["decisao_id"])
+    computation: dict[str, object] = {
+        "revision": state["revisao_estado"],
+        "fisico": {field: deepcopy(state[field]) for field in physical_fields},
+        "dispositivos": deepcopy(state["dispositivos"]),
+        "preferencias": _legacy_protocol_preferences(state),
+        "decisao": decision,
+        "episodio_aberto": episode,
+        "execucao": deepcopy(state["execucao_automatica"]),
+        "metricas": deepcopy(state["metricas"]),
+        "resumo": deepcopy(state["resumo"]),
+    }
+    return cast(protocol.ComputationState, computation)
+
+
+def _legacy_operation_id(
+    route: str,
+    operation: str,
+    payload: Mapping[str, object],
+    raw_input: object,
+    computation: protocol.ComputationState,
+) -> str:
+    value = {
+        "route": route,
+        "operation": operation,
+        "payload": payload,
+        "raw_input": raw_input,
+        "computation": computation,
+    }
+    return sha256(protocol.canonical_json_bytes(value)).hexdigest()
+
+
+def run_legacy_transition(
+    route: str,
+    operation: protocol.MutationOperationKind,
+    payload: Mapping[str, object],
+    *,
+    raw_input: object,
+    state: RoomState | None = None,
+) -> dict[str, object]:
+    selected_state = estado_quarto if state is None else state
+    computation = _legacy_protocol_computation(selected_state)
+    operation_payload = cast(dict[str, object], deepcopy(dict(payload)))
+    if operation == "manual_command":
+        decision_id = operation_payload.get("decisao_id")
+        existing_decision = selected_state["decisao"]
+        if (
+            isinstance(decision_id, str)
+            and isinstance(existing_decision, Mapping)
+            and decision_id == existing_decision.get("decisao_id")
+        ):
+            operation_payload["decisao_id"] = _legacy_protocol_id(decision_id)
+    operation_id = _legacy_operation_id(
+        route,
+        operation,
+        operation_payload,
+        raw_input,
+        computation,
+    )
+    request_body: protocol.TransitionRequest = {
+        "schema_version": 1,
+        "identity_id": _LEGACY_IDENTITY_ID,
+        "identity_generation": 0,
+        "base_revision": computation["revision"],
+        "operation_id": operation_id,
+        "payload_hash": "0" * 64,
+        "operation": operation,
+        "computation": computation,
+        "payload": cast(
+            protocol.CompactPayload,
+            {"kind": operation, **operation_payload},
+        ),
+    }
+    request_body["payload_hash"] = protocol.compute_payload_hash(request_body)
+    import transition
+
+    envelope = transition.run_transition(
+        request_body,
+        expected_identity={
+            "identity_id": _LEGACY_IDENTITY_ID,
+            "identity_generation": 0,
+        },
+    )
+    return {
+        "envelope": cast(dict[str, object], envelope),
+        "operation_id": operation_id,
+        "payload_hash": request_body["payload_hash"],
+        "base_revision": computation["revision"],
+        "source_state": deepcopy(selected_state),
+    }
+
+
+def _legacy_public_state(
+    computation: protocol.ComputationState,
+    source_state: RoomState,
+) -> PublicRoomState:
+    physical = cast(dict[str, object], deepcopy(computation["fisico"]))
+    decision = computation["decisao"]
+    mode = source_state["modo"] if decision is None else decision["modo"]
+    return cast(
+        PublicRoomState,
+        {
+            **physical,
+            "modo": mode,
+            "dispositivos": deepcopy(computation["dispositivos"]),
+        },
+    )
+
+
+def _legacy_public_decision(
+    computation: protocol.ComputationState,
+    source_state: RoomState,
+) -> dict[str, object] | None:
+    decision = computation["decisao"]
+    if decision is None:
+        return None
+    original = source_state["decisao"]
+    base = deepcopy(original) if isinstance(original, Mapping) else {}
+    action = _legacy_action(decision["strategy_id"])
+    base.update(
+        {
+            "decisao_id": decision["decisao_id"],
+            "objetivo": decision["objetivo"],
+            "strategy_id": decision["strategy_id"],
+            "modo": decision["modo"],
+            "status": decision["status"],
+            "acao": action,
+            "acoes": [action],
+            "influenciada": decision["influenciada"],
+            "alternativas": deepcopy(decision["alternativas"]),
+            "plano": deepcopy(decision["plano"]),
+        }
+    )
+    return base
+
+
+def legacy_response(
+    result: Mapping[str, object],
+    *,
+    message: str,
+    decision: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    envelope = cast(Mapping[str, object], result["envelope"])
+    source_state = cast(RoomState, result["source_state"])
+    successful = envelope.get("status") == "success"
+    computation = (
+        cast(protocol.ComputationState, envelope["computation"])
+        if successful
+        else _legacy_protocol_computation(source_state)
+    )
+    events = envelope.get("events", [])
+    steps: list[object] = []
+    if isinstance(events, list) and events and isinstance(events[-1], Mapping):
+        event_data = events[-1].get("dados")
+        if isinstance(event_data, Mapping) and isinstance(
+            event_data.get("steps"), list
+        ):
+            steps = deepcopy(cast(list[object], event_data["steps"]))
+    status = "sucesso" if successful else "erro"
+    response: dict[str, object] = {
+        "status": status,
+        "mensagem": message if successful else str(envelope.get("message", message)),
+        "estado": _legacy_public_state(computation, source_state),
+        "decisao": (
+            deepcopy(dict(decision))
+            if decision is not None
+            else _legacy_public_decision(computation, source_state)
+        ),
+        "etapas": steps,
+        "operation_id": result["operation_id"],
+        "payload_hash": result["payload_hash"],
+        "revision": (
+            envelope.get("new_revision")
+            if successful
+            else envelope.get("current_revision", result["base_revision"])
+        ),
+        "envelope": deepcopy(dict(envelope)),
+    }
+    if not successful:
+        response["codigo"] = envelope.get("code")
+        response["campos"] = deepcopy(envelope.get("fields", []))
+    return response
+
+
+def legacy_validation_response(
+    error: ContractValidationError,
+    route: str,
+    raw_input: object,
+) -> dict[str, object]:
+    state = estado_quarto
+    computation = _legacy_protocol_computation(state)
+    operation_id = _legacy_operation_id(
+        route,
+        "legacy_validation",
+        {"code": error.code, "fields": list(error.fields)},
+        raw_input,
+        computation,
+    )
+    payload_hash = sha256(
+        protocol.canonical_json_bytes(
+            {"route": route, "input": raw_input, "revision": computation["revision"]}
+        )
+    ).hexdigest()
+    error_code: protocol.ErrorCode
+    if error.code == JSON_INVALID:
+        error_code = "invalid_json"
+    elif error.code == UNSAFE_ACTION:
+        error_code = "unsafe_action"
+    elif error.code == INTERNAL_ERROR:
+        error_code = "internal_error"
+    elif error.code in {
+        DECISION_NOT_FOUND,
+        DECISION_NOT_CONFIRMED,
+        DECISION_OBSOLETE,
+        COMMAND_NOT_CONFIRMED,
+    }:
+        error_code = "not_found"
+    else:
+        error_code = "invalid_payload"
+    envelope = protocol.validate_transition_error({
+        "status": "error",
+        "schema_version": 1,
+        "code": error_code,
+        "http_status": protocol.ERROR_HTTP_STATUS[error_code],
+        "message": (
+            "The request could not be completed."
+            if error_code == "internal_error"
+            else error.message
+        ),
+        "fields": list(error.fields),
+        "operation_id": operation_id,
+        "received_revision": computation["revision"],
+        "current_revision": computation["revision"],
+        "snapshot": None,
+    })
+    result = {
+        "envelope": cast(dict[str, object], envelope),
+        "operation_id": operation_id,
+        "payload_hash": payload_hash,
+        "base_revision": computation["revision"],
+        "source_state": deepcopy(state),
+    }
+    return legacy_response(result, message=error.message)
+
+
+def legacy_internal_error_response(route: str, raw_input: object) -> dict[str, object]:
+    error = ContractValidationError(
+        INTERNAL_ERROR,
+        "Falha interna ao processar a requisição.",
+    )
+    return legacy_validation_response(error, route, raw_input)
+
+
 def ajustar(
     temp_str: str | None,
     umid_str: str | None,
@@ -2344,20 +3680,29 @@ def ajustar(
     sempre usa a temperatura interna medida no estado autoritativo.
     """
 
-    _query_number(
-        temp_str,
-        "temperatura",
-        MIN_TEMPERATURE_C,
-        MAX_TEMPERATURE_C,
-    )
-    humidity = _query_number(
-        umid_str,
-        "umidade",
-        MIN_HUMIDITY_PCT,
-        MAX_HUMIDITY_PCT,
-    )
-    sleep = _query_binary(dormir, "dormir")
-    window_open = _query_binary(aberta, "aberta")
+    raw_input = {
+        "temperatura": temp_str,
+        "umidade": umid_str,
+        "dormir": dormir,
+        "aberta": aberta,
+    }
+    try:
+        _query_number(
+            temp_str,
+            "temperatura",
+            MIN_TEMPERATURE_C,
+            MAX_TEMPERATURE_C,
+        )
+        humidity = _query_number(
+            umid_str,
+            "umidade",
+            MIN_HUMIDITY_PCT,
+            MAX_HUMIDITY_PCT,
+        )
+        sleep = _query_binary(dormir, "dormir")
+        window_open = _query_binary(aberta, "aberta")
+    except ContractValidationError as error:
+        return legacy_validation_response(error, "/ajustar", raw_input)
 
     preview_state = deepcopy(estado_quarto)
     preview_state["umidade"] = humidity
@@ -2366,10 +3711,26 @@ def ajustar(
         preview_state["presenca_interna"] = 1
     preview_state["dispositivos"]["janela"] = window_open
     _refresh_luminosity(preview_state)
-
-    response = pegar_status()
-    response["decisao"] = _preview_decision(preview_state)
-    return response
+    environment = {
+        "hora": preview_state["hora"],
+        "temperatura_externa": preview_state["temperatura_externa"],
+        "umidade": preview_state["umidade"],
+        "chuva": preview_state["chuva"],
+        "presenca_interna": preview_state["presenca_interna"],
+        "presenca_externa": preview_state["presenca_externa"],
+        "dormir": preview_state["dormir"],
+    }
+    result = run_legacy_transition(
+        "/ajustar",
+        "environment",
+        environment,
+        raw_input=raw_input,
+    )
+    return legacy_response(
+        result,
+        message="Prévia do ambiente ajustado.",
+        decision=_preview_decision(preview_state),
+    )
 
 
 def apply_preset_request(payload: object) -> dict[str, object]:
@@ -2387,12 +3748,41 @@ def apply_preset_request(payload: object) -> dict[str, object]:
     return response
 
 
+def _start_new_run(state: RoomState, *, paused: bool) -> None:
+    run_id = uuid4().hex
+    state["run_id"] = run_id
+    state["pruned_before"] = 0
+    state["metricas"] = []
+    state["resumo"] = _empty_run_summary(run_id)
+    state["rastro"] = []
+    state["decisao"] = None
+    state["decisao_pendente"] = None
+    state["etapas"] = []
+    state["episodio_aberto"] = None
+    state["feedbacks"] = []
+    state["ultima_acao_confirmada"] = None
+    state["execucao_automatica"] = {"pausada": paused}
+    state["revisao_estado"] += 1
+    _clear_confirmed_command_registry(state)
+
+
+def new_run() -> dict[str, object]:
+    _start_new_run(estado_quarto, paused=False)
+    response = pegar_status()
+    response["mensagem"] = "Nova execução iniciada."
+    response["decisao"] = None
+    response["etapas"] = []
+    return response
+
+
 def reset_environment(payload: object) -> dict[str, object]:
-    """Limpa a jornada visível, preservando aprendizagem e rastro."""
+    """Limpa a jornada, preferências, métricas e rastro em uma nova execução."""
 
     validate_reset_request(payload)
     reset_config_state()
-    _clear_confirmed_command_registry(estado_quarto)
+    estado_quarto["preferencias"].clear()
+    _start_new_run(estado_quarto, paused=True)
+    estado_quarto["modo"] = "reativo"
     response = pegar_status()
     response["decisao"] = None
     response["etapas"] = []
@@ -2425,14 +3815,75 @@ def _decision_status_is_confirmed(decision: Mapping[str, object]) -> bool:
 def _decision_action(decision: Mapping[str, object]) -> ActionName:
     """Obtém e valida a ação vencedora de uma decisão."""
 
-    action = decision.get("acao", decision.get("action"))
-    if action not in _PLAN_STEPS:
+    action = decision.get("strategy_id")
+    if not isinstance(action, str):
+        action = decision.get("acao", decision.get("action"))
+    if action == "umidificacao":
+        action = "umidificar"
+    elif action == "iluminacao":
+        action = "iluminar"
+    if not isinstance(action, str):
         _fail(
             CORRECTION_INCOMPATIBLE,
             "A decisão não contém uma ação compatível.",
             ["decisao_id"],
         )
-    return cast(ActionName, action)
+    try:
+        return _normalise_action(action)
+    except ValueError:
+        _fail(
+            CORRECTION_INCOMPATIBLE,
+            "A decisão não contém uma ação compatível.",
+            ["decisao_id"],
+        )
+
+
+def _decision_strategy_id(decision: Mapping[str, object]) -> str:
+    """Resolve the canonical strategy independently of explanatory context."""
+
+    value = decision.get("strategy_id")
+    if isinstance(value, str):
+        try:
+            return _strategy_id(value)
+        except ValueError:
+            pass
+    action = decision.get("acao", decision.get("action"))
+    if not isinstance(action, str):
+        _fail(
+            CORRECTION_INCOMPATIBLE,
+            "A decisão não contém uma estratégia compatível.",
+            ["decisao_id"],
+        )
+    try:
+        return _strategy_id(action)
+    except ValueError:
+        _fail(
+            CORRECTION_INCOMPATIBLE,
+            "A decisão não contém uma estratégia compatível.",
+            ["decisao_id"],
+        )
+
+
+def _decision_objective(decision: Mapping[str, object]) -> DecisionObjective:
+    """Read the objective that scopes a preference record."""
+
+    value = decision.get("objetivo", decision.get("objective"))
+    if isinstance(value, str) and value in {
+        "seguranca",
+        "umidade",
+        "termico",
+        "iluminacao",
+        "manutencao",
+    }:
+        return cast(DecisionObjective, value)
+    action = decision.get("strategy_id", decision.get("acao", decision.get("action")))
+    if isinstance(action, str):
+        return _default_preference_objective(action)
+    _fail(
+        CORRECTION_INCOMPATIBLE,
+        "A decisão não contém um objetivo compatível.",
+        ["decisao_id"],
+    )
 
 
 def _ensure_cognitive_feedback(decision: Mapping[str, object]) -> None:
@@ -2576,7 +4027,7 @@ def _decision_context(
     state: RoomState,
     decision: Mapping[str, object],
 ) -> LearningContext:
-    """Obtém o snapshot contextual da decisão, sem usar sinais posteriores."""
+    """Read explanatory context from the decision without making it normative."""
 
     value = decision.get("contexto", decision.get("context"))
     if not isinstance(value, Mapping):
@@ -2824,10 +4275,21 @@ def correction_is_eligible(
     if objective not in {"umidade", "termico", "iluminacao", "manutencao"}:
         return False
     objective_name = cast(DecisionObjective, objective)
-    action_value = decision_value.get("acao", decision_value.get("action"))
-    if not isinstance(action_value, str) or action_value not in _CORRECTION_MATRIX:
+    action_value = decision_value.get("strategy_id")
+    if not isinstance(action_value, str):
+        action_value = decision_value.get("acao", decision_value.get("action"))
+    if action_value == "umidificacao":
+        action_value = "umidificar"
+    elif action_value == "iluminacao":
+        action_value = "iluminar"
+    if not isinstance(action_value, str):
         return False
-    action = cast(ActionName, action_value)
+    try:
+        action = _normalise_action(action_value)
+    except ValueError:
+        return False
+    if action not in _CORRECTION_MATRIX:
+        return False
     if objective_name not in _CORRECTION_OBJECTIVES[action]:
         return False
     if objective in {
@@ -2983,7 +4445,7 @@ def _feedback_identity(
     decision: Mapping[str, object],
     context: LearningContext,
 ) -> LearningIdentity:
-    """Materialize the frozen identity captured by the decision snapshot."""
+    """Materialize explanatory context frozen with the decision snapshot."""
 
     value = decision.get("identidade")
     identity_context = context
@@ -3026,7 +4488,7 @@ def record_feedback(
     """Registra feedback e atualiza a preferência somente em memória.
 
     A forma pública ``record_feedback(contexto, acao, tipo)`` usa o estado
-    global do simulador para preservar a memória contextual.
+    global do simulador. O contexto explica a observação, mas não compõe a chave.
     Feedback comum usa a decisão confirmada e ``aceitar``/``rejeitar``.
     ``corrigir`` exige uma confirmação manual relacionada e não neutra.
     """
@@ -3048,13 +4510,14 @@ def record_feedback(
             raise ValueError("A forma pública não aceita correlação adicional.")
         context = _validated_context(cast(Mapping[str, object], state))
         action = _normalise_action(decision)
+        objective = _default_preference_objective(action)
         _, delta = _normalise_feedback_type(public_feedback_type)
-        preference_key = _preference_key(context, action)
-        previous = _preference_for(estado_quarto, context, action)
+        preference_key = _preference_key(context, action, objective)
+        previous = _preference_for(estado_quarto, context, action, objective)
         if (delta == 1 and previous >= 3) or (delta == -1 and previous <= -3):
             _fail(
                 PREFERENCE_AT_LIMIT,
-                "A preferência já está no limite para esta identidade e ação.",
+                "A preferência já está no limite para este objetivo e estratégia.",
                 ["preferencia"],
             )
         current = previous + delta
@@ -3134,6 +4597,8 @@ def record_feedback(
     resolved_decision = _resolve_decision(state, decision)
     _ensure_cognitive_feedback(resolved_decision)
     action = _decision_action(resolved_decision)
+    objective = _decision_objective(resolved_decision)
+    strategy_id = _decision_strategy_id(resolved_decision)
     context = _decision_context(state, resolved_decision)
     identity = _feedback_identity(resolved_decision, context)
     active_decision_id = _decision_id(resolved_decision) or resolved_decision_id
@@ -3197,22 +4662,26 @@ def record_feedback(
             ["comando_id"],
         )
 
-    preference_key = _preference_key(context, action)
-    previous = _preference_for(state, context, action)
+    preference_key = _preference_key(context, strategy_id, objective)
+    previous = _preference_for(state, context, strategy_id, objective)
     if (delta == 1 and previous >= 3) or (delta == -1 and previous <= -3):
         _fail(
             PREFERENCE_AT_LIMIT,
-            "A preferência já está no limite para esta identidade e ação.",
+            "A preferência já está no limite para este objetivo e estratégia.",
             ["preferencia"],
         )
     current = previous + delta
     state["preferencias"][preference_key] = current
-    if canonical_type == "corrigir" and action == "ventilar":
+    if canonical_type == "corrigir" and action in {
+        "ventilacao_natural",
+        "ventilacao_assistida",
+        "circulacao_interna",
+    }:
         state["ultima_acao_confirmada"] = None
     result: FeedbackResult = {
         "decisao_id": active_decision_id,
         "tipo": canonical_type,
-        "acao": action,
+        "acao": cast(ActionName, _legacy_action(action)),
         "identidade": deepcopy(identity),
         "preferencia_anterior": previous,
         "delta": delta,
@@ -3240,5 +4709,6 @@ def record_feedback(
             "resultado": deepcopy(result),
         },
     )
+    record_observed_feedback(state, active_decision_id, canonical_type)
     return result
 

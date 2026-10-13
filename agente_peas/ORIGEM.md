@@ -1,8 +1,7 @@
 # Origem do backend
 
-services.py e config.py vieram de https://github.com/vonderheidon/atividade-peas-v1
-Commit: 5521fb7300f31805a9de92b48abe0287b093bbe2
-Autor do projeto de origem: vonderheidon e colaboradores.
+Código Python atualizado a partir da pasta local `atividade-peas-v1`, em 08/10/2026, projeto https://github.com/vonderheidon/atividade-peas-v1 (vonderheidon e colaboradores).
 
-Adaptação: import relativo de config. Não foram copiados templates, assets ou frontend 3D.
-A integração chama make_decision em uma cópia isolada do estado. Não executa a física simulada, não confirma estados reais e não ativa aprendizagem ou feedback.
+Copiados `services.py`, `config.py` e o pacote `shared`. Alterados somente os imports para relativos ao pacote `agente_peas`. Não foram copiados templates, JavaScript, cena 3D ou assets.
+
+O perfil de hardware em `agente_hardware.py` reutiliza funções públicas de custo, economia, conforto e utilidade; o controlador real substitui a simulação da atuação/física por HTTP e novas leituras DHT11. `Controller._command` é o ponto central para a execução real. Feedback é persistido e correlacionado por decisão. As funções simuladas permanecem disponíveis no código de referência, mas `run_cycle` não é usado no hardware.

@@ -5,12 +5,21 @@ from __future__ import annotations
 from collections.abc import Hashable, Mapping
 from copy import deepcopy
 from typing import Final, Literal, TypeAlias, TypedDict, cast
+from uuid import uuid4
+
+from .shared.peas_protocol import (
+    Binary,
+    CycleMetrics,
+    DeviceVector,
+    EpisodeState,
+    Luminosity,
+    Mode,
+    PhysicalState,
+    PresetName,
+    RunSummary,
+)
 
 
-Binary: TypeAlias = Literal[0, 1]
-Luminosity: TypeAlias = Literal["escuro", "adequado", "claro"]
-Mode: TypeAlias = Literal["reativo", "cognitivo"]
-PresetName: TypeAlias = Literal["calor", "frio", "conforto"]
 TraceEventType: TypeAlias = Literal[
     "preset",
     "ciclo",
@@ -30,14 +39,7 @@ _TRACE_EVENT_TYPES: Final[tuple[TraceEventType, ...]] = (
 )
 
 
-class PresetDevices(TypedDict):
-    """Estados binários dos dispositivos fornecidos por um preset."""
-
-    janela: Binary
-    ar: Binary
-    ventilador: Binary
-    umidificador: Binary
-    lampada: Binary
+PresetDevices: TypeAlias = DeviceVector
 
 
 class PresetState(TypedDict):
@@ -70,26 +72,21 @@ class TraceEvent(TypedDict):
     dados: dict[str, object]
 
 
-class RoomState(TypedDict):
+class RoomState(PhysicalState):
     """Estado em memória do ambiente, da decisão e da execução."""
 
-    preset_atual: PresetName | None
     revisao_estado: int
-    hora: int
-    temperatura_externa: float
-    temperatura_interna: float
-    umidade: float
-    luminosidade: Luminosity
-    chuva: Binary
-    presenca_interna: Binary
-    presenca_externa: Binary
-    dormir: Binary
+    run_id: str
+    pruned_before: int
     modo: Mode
     dispositivos: PresetDevices
     ultima_acao_confirmada: str | None
     decisao: dict[str, object] | None
     etapas: list[dict[str, object]]
     preferencias: dict[Hashable, int]
+    metricas: list[CycleMetrics]
+    resumo: RunSummary
+    episodio_aberto: EpisodeState | None
     feedbacks: list[object]
     rastro: list[TraceEvent]
     decisao_pendente: dict[str, object] | None
@@ -170,16 +167,19 @@ def _preset_name(value: PresetName | str) -> PresetName:
 
     if value not in PRESETS:
         raise PresetError(f"Preset desconhecido: {value!r}")
-    return value
+    return cast(PresetName, value)
 
 
 def _state_from_preset(name: PresetName) -> RoomState:
     """Cria um estado completo sem compartilhar estruturas mutáveis."""
 
     preset = deepcopy(PRESETS[name])
+    run_id = uuid4().hex
     return {
         "preset_atual": None,
         "revisao_estado": 0,
+        "run_id": run_id,
+        "pruned_before": 0,
         "hora": preset["hora"],
         "temperatura_externa": preset["temperatura_externa"],
         "temperatura_interna": preset["temperatura_interna"],
@@ -195,6 +195,24 @@ def _state_from_preset(name: PresetName) -> RoomState:
         "decisao": None,
         "etapas": [],
         "preferencias": {},
+        "metricas": [],
+        "resumo": {
+            "run_id": run_id,
+            "ciclos": 0,
+            "custo_energetico_total": 0.0,
+            "custo_energetico_medio": None,
+            "conforto_acumulado": 0.0,
+            "conforto_medio": None,
+            "ciclos_seguros": 0,
+            "prevencoes": 0,
+            "incidentes": 0,
+            "aceitacoes": 0,
+            "correcoes": 0,
+            "feedbacks_observados": 0,
+            "satisfacao_acumulada": 0.0,
+            "satisfacao_observada": None,
+        },
+        "episodio_aberto": None,
         "feedbacks": [],
         "rastro": [],
         "decisao_pendente": None,
@@ -208,7 +226,10 @@ estado_quarto: RoomState = _state_from_preset("conforto")
 def validate_trace(state: RoomState) -> None:
     """Valida tipos permitidos e ordem estritamente crescente do rastro."""
 
-    previous_order = 0
+    watermark = state["pruned_before"]
+    if type(watermark) is not int or watermark < 0:
+        raise TraceError("O watermark do rastro deve ser um inteiro não negativo.")
+    previous_order = watermark
     expected_fields = {"ordem", "tipo", "decisao_id", "comando_id", "dados"}
     for event in state["rastro"]:
         if set(event) != expected_fields:
@@ -246,7 +267,10 @@ def append_trace_event(
         if value is not None and (not isinstance(value, str) or not value.strip()):
             raise TraceError(f"{field} deve ser uma string não vazia ou nulo.")
     event: TraceEvent = {
-        "ordem": state["rastro"][-1]["ordem"] + 1 if state["rastro"] else 1,
+        "ordem": max(
+            state["pruned_before"],
+            state["rastro"][-1]["ordem"] if state["rastro"] else 0,
+        ) + 1,
         "tipo": tipo,
         "decisao_id": decisao_id,
         "comando_id": comando_id,
@@ -272,7 +296,7 @@ def invalidate_decision(
         return None
     if active.get("status") == "invalidada":
         return None
-    invalidated = cast(dict[str, object], deepcopy(dict(active)))
+    invalidated = deepcopy(dict(active))
     invalidated["status"] = "invalidada"
     state["decisao"] = invalidated
     state["decisao_pendente"] = None
