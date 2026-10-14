@@ -8,6 +8,7 @@ from agente_hardware import DISPOSITIVOS
 from controller import Conflict
 from esp_transport import validate_lan_ip
 from storage import Command, Decision, Device, Feedback, Plate, Reading, utc, utcnow
+from logs_banco import instalar_logs
 
 
 def instalar(app, store, controller):
@@ -230,3 +231,4 @@ def instalar(app, store, controller):
         return render_template('painel.html')
 
     app.register_blueprint(bp)
+    instalar_logs(app, store)

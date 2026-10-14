@@ -78,6 +78,8 @@ Todos os endereços abaixo são do Flask, na porta 5050. Quando existir mais de 
 | POST | `/agente/feedback` | Gostei/não gostei associado à decisão |
 | GET | `/agente/status` | Estados estimados, decisão e preferências |
 | GET | `/historico` | Últimas 50 decisões e resultados |
+| GET | `/log` | Tabela das últimas 100 leituras, decisões e comandos automáticos |
+| GET | `/log/json` | Os mesmos registros em JSON |
 | GET | `/analise` | Contagens, falhas e médias das leituras |
 
 Rotas legadas `/interf/ligarventilador`, `/interf/desligarventilador`, `/interf/ligarumidificador`, `/interf/desligarumidificador` apontam para os mesmos métodos. `POST /ventilador` e `POST /umidificador` agora significam **ligar com três pulsos**, e não apenas um clique. `/interf/feedback` aceita o contrato booleano abaixo.
@@ -119,3 +121,23 @@ Leituras com mais de cinco minutos não acionam comandos. Leituras antigas subst
 A suíte substitui o transporte HTTP por uma fixture e não aciona aparelhos. A suíte PostgreSQL cria schemas temporários `tcc_test_*`, testa o backend e remove apenas esses schemas. Não apaga registros do banco real. Casos cobrem 3/1 pulsos, timeout parcial, ausência de repetição, fila independente da interface, histerese, feedback, adaptação após rejeições, persistência, origem das leituras, concorrência e prioridade da boia.
 
 Referências técnicas: [SQLAlchemy PostgreSQL](https://docs.sqlalchemy.org/en/20/dialects/postgresql.html#psycopg), [Psycopg](https://www.psycopg.org/psycopg3/docs/basic/install.html), [projeto PEAS de origem](https://github.com/vonderheidon/atividade-peas-v1).
+
+## Log de ações para acompanhamento
+
+Abra [o log](http://localhost:5050/log) ou o link **Log de ações** no painel.
+A tabela consulta os dados existentes do PostgreSQL e atualiza a cada 30 segundos.
+Ela mostra as últimas 100 leituras com horário de Brasília, placa, temperatura,
+umidade, água, modo da decisão, estados estimados e resultados dos comandos
+automáticos. “Mantido” indica que não houve novo pulso; confirmações e falhas
+mostram quantos pulsos foram confirmados. Sem decisão ou confirmação, o estado
+histórico aparece como não confirmado, sem usar o estado atual como se fosse passado.
+
+`GET /log/json` retorna os mesmos dados. Os filtros `?placa=esp32c3vent` e
+`?limite=50` são opcionais; o limite aceito é de 1 a 100. A leitura mais recente
+aparece primeiro. Leituras recebidas com o automático pausado também aparecem.
+O histórico usa as decisões e os comandos automáticos associados a cada leitura;
+não é um arquivo de logs internos do PostgreSQL nem uma medição física dos aparelhos.
+
+Abrir ou atualizar o log só executa consultas SELECT. Não exige alteração no
+Arduino, não cria tabelas e não altera regras, preferências ou estados dos aparelhos.
+Após instalar a atualização, reinicie o Flask para registrar as novas rotas.

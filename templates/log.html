@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="refresh" content="30">
+  <title>Log de ações do agente — TCC</title>
+  <style>
+    *{box-sizing:border-box}body{margin:0;padding:28px;font:16px Arial,sans-serif;color:#243444;background:#f7f9fb}
+    main{max-width:1600px;margin:auto}h1{margin:0 0 14px;font-size:30px}p{line-height:1.5}a{color:#007d73}
+    nav{margin:16px 0 22px}form{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:20px 0}
+    select,button{font:inherit;padding:8px 12px;border:1px solid #a9b8bd;border-radius:4px;background:white}
+    button{cursor:pointer}small,.muted{color:#516571}small{display:block;margin-top:5px;line-height:1.45}
+    .tabela{overflow-x:auto;background:white;border:1px solid #cad5da;border-radius:4px}
+    table{width:100%;min-width:1160px;border-collapse:collapse;font-size:14px}th,td{padding:13px 12px;text-align:left;vertical-align:top;border:1px solid #d1dadd}
+    th{background:#007e73;color:white;white-space:nowrap}tbody tr:nth-child(even){background:#edf9f7}
+    td.horario{white-space:nowrap}.numero{white-space:nowrap}ul{margin:0;padding-left:18px}li+li{margin-top:12px}
+    .estado{font-weight:bold}.erro{color:#a12626}.vazio{text-align:center;padding:36px}.nota{font-size:14px}
+    @media(max-width:650px){body{padding:18px}h1{font-size:25px}}
+  </style>
+</head>
+<body><main>
+  <h1>Log de ações do agente</h1>
+  <p>Exibindo {{ dados.quantidade }} das últimas {{ dados.limite }} leituras, da mais recente para a mais antiga.
+    A página é atualizada a cada 30 segundos.</p>
+  <nav><a href="{{ url_for('esp_backend.pagina') }}">Voltar ao painel</a> · <a href="{{ json_url }}">Ver como JSON</a> · <a href="{{ request.full_path }}">Atualizar agora</a></nav>
+  <form method="get" action="{{ url_for('logs_banco.pagina') }}">
+    <label for="placa">Placa</label>
+    <select id="placa" name="placa"><option value="">Todas as placas</option>
+      {% for placa in dados.placas %}<option value="{{ placa }}" {% if placa == dados.placa %}selected{% endif %}>{{ placa }}</option>{% endfor %}
+    </select>
+    <input type="hidden" name="limite" value="{{ dados.limite }}">
+    <button type="submit">Filtrar</button>
+    <span class="muted">Horários: {{ dados.fuso }}</span>
+  </form>
+  <div class="tabela"><table>
+    <thead><tr><th>Data e hora</th><th>Temperatura</th><th>Umidade</th><th>Água</th><th>Modo</th>
+      <th>Ventilador<br><small style="color:white">Estado estimado</small></th>
+      <th>Umidificador<br><small style="color:white">Estado estimado</small></th><th>Ações e resultado</th></tr></thead>
+    <tbody>
+    {% for r in dados.registros %}
+      <tr data-leitura-id="{{ r.leitura_id }}">
+        <td class="horario">{{ r.horario }}<small>{{ r.placa }} · leitura #{{ r.leitura_id }}</small></td>
+        <td class="numero">{{ '%.1f'|format(r.temperatura) }} °C</td>
+        <td class="numero">{{ '%.1f'|format(r.umidade) }} %</td>
+        <td>{{ r.agua }}</td>
+        <td>{{ 'Reativo' if r.modo == 'reativo' else 'Cognitivo e adaptativo' if r.modo == 'cognitivo' else 'Sem decisão' }}</td>
+        {% for nome in nomes %}<td><span class="estado">{{ r.dispositivos[nome].rotulo }}</span></td>{% endfor %}
+        <td><strong>{{ r.situacao }}</strong>
+          {% if r.decisao_id %}<ul>{% for nome, rotulo in nomes.items() %}
+            {% set d = r.dispositivos[nome] %}<li><span {% if d.status in ['falhou','interrompido'] %}class="erro"{% endif %}>{{ rotulo }}: {{ d.descricao }}</span>
+              {% if d.justificativa %}<small>{{ d.justificativa }}</small>{% endif %}</li>
+          {% endfor %}</ul>
+          <small>Decisão: {{ r.decisao_id }}</small>
+          {% else %}<small>Nenhuma decisão associada a esta leitura.</small>{% endif %}
+          {% if r.erro_leitura %}<small class="erro">{{ r.erro_leitura }}</small>{% endif %}
+          {% if r.feedback is not none %}<small>Feedback: {{ 'Gostei' if r.feedback else 'Não gostei' }}</small>{% endif %}
+        </td>
+      </tr>
+    {% else %}<tr><td colspan="8" class="vazio">Nenhuma leitura registrada para esta consulta.</td></tr>{% endfor %}
+    </tbody>
+  </table></div>
+  <p class="nota muted">Consulta dos registros já gravados no banco. Esta página não aciona aparelhos.
+    “Mantido” significa que nenhum novo pulso foi necessário. Os estados são estimados pelo histórico de comandos; não há medição do funcionamento físico dos aparelhos.</p>
+</main></body></html>
