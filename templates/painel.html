@@ -2,9 +2,10 @@
 <html lang="pt-BR">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Agente do quarto — TCC</title>
-<style>body{font:16px system-ui;margin:40px auto;max-width:850px;padding:20px;color:#123;background:#f3f6fa}section{background:white;padding:24px;border-radius:12px;margin:18px 0}button,select{font:inherit;padding:10px;margin:5px;cursor:pointer}pre{white-space:pre-wrap}#erro{color:#a21}</style></head>
+<style>body{font:16px system-ui;margin:40px auto;max-width:850px;padding:20px;color:#123;background:#f3f6fa}section{background:white;padding:24px;border-radius:12px;margin:18px 0}button,select{font:inherit;padding:10px;margin:5px;cursor:pointer}pre{white-space:pre-wrap}#erro{color:#a21}#alerta{padding:16px;border:1px solid #d89b35;background:#fff4df;color:#673d00;border-radius:8px;line-height:1.5}</style></head>
 <body><h1>Agente do quarto</h1>
 <label>Placa <select id="placa"></select></label><p id="erro" role="status"></p>
+<p id="alerta" role="alert" hidden></p>
 <section><h2>Preparação</h2><p>Antes de sincronizar, deixe os dois aparelhos fisicamente desligados. Se usar um botão físico ou reiniciar a ESP32, pause o agente e sincronize novamente.</p>
 <button id="sync">Confirmar ambos desligados</button>
 <select id="modo"><option value="cognitivo">Cognitivo e adaptativo</option><option value="reativo">Reativo</option></select>
@@ -17,7 +18,7 @@
 const el=id=>document.getElementById(id); let atual=null;
 const url=rota=>rota+'?placa='+encodeURIComponent(el('placa').value);
 async function api(rota,body){const r=await fetch(url(rota),body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await r.json();if(!r.ok)throw new Error(data.erro||'Falha na operação.');return data;}
-async function atualizar(){try{if(!el('placa').value)return;atual=await api('/agente/status');el('resumo').textContent=(atual.automatico?'Automático ativo':'Automático pausado')+' | ESP: '+atual.ip+(atual.ip_fixo?' (IP fixo)':'')+' | estados estimados: '+JSON.stringify(atual.estados_estimados);const d=atual.decisao;el('decisao').textContent=d?d.propostas.map(p=>p.dispositivo+': '+p.comando+' — '+p.justificativa).join('\n')+'\nExecução: '+d.status:'Aguardando leitura da ESP32.';const habilitar=d&&d.status==='executada'&&d.modo==='cognitivo'&&atual.feedback===null;el('gostei').disabled=!habilitar;el('naogostei').disabled=!habilitar;el('feedback').textContent=atual.feedback===null?'':(atual.feedback?'Gostei registrado.':'Não gostei registrado.');el('logs').href=url('/log');el('analise').href=url('/analise');el('historico').href=url('/historico');}catch(e){el('erro').textContent=e.message;}}
+async function atualizar(){try{if(!el('placa').value)return;atual=await api('/agente/status');el('alerta').hidden=!atual.precisa_sincronizar;el('alerta').textContent=(atual.automatico?'':'Automático pausado. ')+(atual.alerta||'');el('resumo').textContent=(atual.automatico?'Automático ativo':'Automático pausado')+' | ESP: '+atual.ip+(atual.ip_fixo?' (IP fixo)':'')+' | estados estimados: '+JSON.stringify(atual.estados_estimados);const d=atual.decisao;el('decisao').textContent=d?d.propostas.map(p=>p.dispositivo+': '+p.comando+' — '+p.justificativa).join('\n')+'\nExecução: '+d.status:'Aguardando leitura da ESP32.';const habilitar=d&&d.status==='executada'&&d.modo==='cognitivo'&&atual.feedback===null;el('gostei').disabled=!habilitar;el('naogostei').disabled=!habilitar;el('feedback').textContent=atual.feedback===null?'':(atual.feedback?'Gostei registrado.':'Não gostei registrado.');el('logs').href=url('/log');el('analise').href=url('/analise');el('historico').href=url('/historico');}catch(e){el('erro').textContent=e.message;}}
 async function acao(rota,body){el('erro').textContent='';try{await api(rota,body);await atualizar();}catch(e){el('erro').textContent=e.message;}}
 el('sync').onclick=()=>acao('/agente/sincronizar',{ventilador:false,umidificador:false});
 el('ativar').onclick=()=>acao('/agente/configurar',{automatico:true,modo:el('modo').value});

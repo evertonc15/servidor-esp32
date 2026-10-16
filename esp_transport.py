@@ -40,22 +40,26 @@ class PulseError(OSError):
 
 
 class EspTransport:
-    def __init__(self, timeout=3, pulse_gap=0.35, sleep=time.sleep):
+    def __init__(self, timeout=3, pulse_gap=0.35, sleep=time.sleep, command_timeout=10):
         timeout = float(timeout)
+        command_timeout = float(command_timeout)
         pulse_gap = float(pulse_gap)
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("timeout deve ser finito e maior que zero.")
+        if not math.isfinite(command_timeout) or command_timeout <= 0:
+            raise ValueError("command_timeout deve ser finito e maior que zero.")
         if not math.isfinite(pulse_gap) or pulse_gap < 0:
             raise ValueError("pulse_gap deve ser finito e não negativo.")
         self.timeout = timeout
+        self.command_timeout = command_timeout
         self.pulse_gap = pulse_gap
         self.sleep = sleep
 
-    def read(self, ip, endpoint):
+    def read(self, ip, endpoint, *, timeout=None):
         ip = validate_lan_ip(ip)
         if endpoint not in _ENDPOINTS:
             raise ValueError("Endpoint da ESP32 não permitido.")
-        connection = http.client.HTTPConnection(ip, 80, timeout=self.timeout)
+        connection = http.client.HTTPConnection(ip, 80, timeout=self.timeout if timeout is None else timeout)
         try:
             connection.request("GET", endpoint)
             response = connection.getresponse()
@@ -78,14 +82,15 @@ class EspTransport:
         confirmed = 0
         for attempt in range(1, total + 1):
             try:
-                response = self.read(ip, "/" + dispositivo)
+                response = self.read(ip, "/" + dispositivo, timeout=self.command_timeout)
                 if response != "OK":
                     raise OSError("Resposta da ESP32 não confirmou o pulso com OK.")
             except (OSError, http.client.HTTPException) as exc:
                 raise PulseError(
                     confirmed, attempt,
                     "Sem confirmação do pulso; ele pode ter ocorrido. "
-                    "Não repetir automaticamente. " + str(exc),
+                    f"Não repetir automaticamente. {dispositivo}, chamada {attempt}/{total}, "
+                    f"espera de {self.command_timeout:g} s. " + str(exc),
                 ) from exc
             confirmed += 1
             if attempt < total:

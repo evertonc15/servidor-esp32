@@ -117,14 +117,26 @@ class Controller:
                 r.level = level
                 r.status = 'processando'
             results = []
+            unknown_state = any(p['bloqueado'] for p in plan['propostas'])
+            if unknown_state:
+                with self.store.session() as s:
+                    s.get(Plate, name).automatic = False
+            interrupted = False
             for proposal in plan['propostas']:
                 if proposal['bloqueado']:
                     results.append({'dispositivo': proposal['dispositivo'], 'status': 'estado_desconhecido'})
+                    interrupted = True
+                    continue
+                if unknown_state or interrupted:
+                    results.append({'dispositivo': proposal['dispositivo'], 'status': 'nao_executado',
+                                    'erro': 'Automatico pausado apos estado desconhecido ou falha.'})
                     continue
                 if not proposal['alterar']:
                     results.append({'dispositivo': proposal['dispositivo'], 'status': 'mantido'})
                     continue
-                results.append(self._command(name, proposal['dispositivo'], proposal['ligado'], decision_id))
+                result = self._command(name, proposal['dispositivo'], proposal['ligado'], decision_id)
+                results.append(result)
+                interrupted = result['status'] in ('falhou', 'estado_desconhecido')
             failed = any(r['status'] in ('falhou', 'estado_desconhecido') for r in results)
             with self.store.session() as s:
                 d = s.get(Decision, decision_id)
@@ -166,6 +178,7 @@ class Controller:
             plate = s.get(Plate, name)
             d = s.get(Device, (name, device))
             if d.state is None:
+                plate.automatic = False
                 return {'dispositivo': device, 'status': 'estado_desconhecido', 'erro': 'Sincronize o estado fisico antes de enviar pulsos.'}
             if d.state == target:
                 return {'dispositivo': device, 'status': 'mantido', 'pulsos': 0, 'ligado_estimado': target}
@@ -183,6 +196,9 @@ class Controller:
                 c.status, c.error = 'falhou', str(error)
                 c.confirmed, c.attempted = error.confirmed, error.attempted
                 c.finished = utcnow()
+                s.get(Plate, name).automatic = False
+            self.log.warning('Automatico pausado em %s: falha em %s; %s pulso(s) confirmado(s), %s chamada(s).',
+                             name, device, error.confirmed, error.attempted)
             return {'dispositivo': device, 'status': 'falhou', 'comando_id': cmd_id,
                     'pulsos_confirmados': error.confirmed, 'estado_estimado': None}
         with self.store.session() as s:

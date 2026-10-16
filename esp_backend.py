@@ -199,8 +199,12 @@ def instalar(app, store, controller):
             d = s.scalar(select(Decision).where(Decision.plate == name).order_by(Decision.created.desc()).limit(1))
             states = {d.name: d.state for d in s.scalars(select(Device).where(Device.plate == name))}
             feedback = s.get(Feedback, d.id) if d else None
+            unknown = [nome for nome, state in states.items() if state is None]
+            warning = ('Estado desconhecido: ' + ', '.join(unknown) +
+                       '. Confira fisicamente os aparelhos e sincronize os estados antes de retomar.') if unknown else None
             return {'placa': name, 'ip': p.ip, 'automatico': p.automatic, 'modo': p.mode,
                     'ip_fixo': p.static_ip,
+                    'precisa_sincronizar': bool(unknown), 'alerta': warning,
                     'estados_estimados': states, 'preferencias': store.preferences(s, name),
                     'decisao': None if not d else dict(d.body, decisao_id=d.id, status=d.status),
                     'feedback': None if feedback is None else feedback.liked}

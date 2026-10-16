@@ -107,7 +107,7 @@ O perfil adaptativo recebe feedback booleano da decisão executada e soma **+1**
 
 A confirmação `OK` mede a execução do pulso no firmware, e não o estado físico do aparelho. O banco armazena um **estado estimado**, fundamentado na sincronização inicial e na sequência de cliques informada. Não envia novamente ligar/desligar se já estima o mesmo estado. Pulsos são serializados por placa, inclusive entre processos via advisory lock PostgreSQL.
 
-Antes do primeiro pulso, a intenção é gravada e o estado passa a desconhecido. Falha ou interrupção deixa esse estado desconhecido; não há repetição automática de pulsos. Sincronize fisicamente de novo para retomar. Se apertar botões do aparelho, usar a página direta da ESP32 ou reiniciar a placa, pause e sincronize. O firmware atual não fornece estado/boot_id e não detecta sozinho essas alterações. Troca de IP ou retorno após mais de cinco minutos sem atividade invalida estados e pausa o automático.
+Antes do primeiro pulso, a intenção é gravada e o estado passa a desconhecido. Falha ou interrupção deixa esse estado desconhecido; não há repetição automática de pulsos. Uma falha de execução pausa o automático da placa e cancela as ações restantes daquela decisão. O painel mostra um aviso de sincronização necessária. Sincronize fisicamente de novo para retomar. Se apertar botões do aparelho, usar a página direta da ESP32 ou reiniciar a placa, pause e sincronize. O firmware atual não fornece estado/boot_id e não detecta sozinho essas alterações. Troca de IP ou retorno após mais de cinco minutos sem atividade invalida estados e pausa o automático.
 
 Leituras com mais de cinco minutos não acionam comandos. Leituras antigas substituídas por uma mais nova não executam. Histórico inclui leituras, boia, decisões, alternativas, resultados por aparelho, comandos, pulsos confirmados/tentados, falhas e feedbacks. Preferências sobrevivem ao reinício do servidor. `/analise` faz agregações sobre dados reais; não infere sozinho eficácia física dos aparelhos.
 
@@ -141,3 +141,27 @@ não é um arquivo de logs internos do PostgreSQL nem uma medição física dos 
 Abrir ou atualizar o log só executa consultas SELECT. Não exige alteração no
 Arduino, não cria tabelas e não altera regras, preferências ou estados dos aparelhos.
 Após instalar a atualização, reinicie o Flask para registrar as novas rotas.
+
+## Resposta lenta e recuperação de execução incompleta
+
+O prazo dos comandos dos relés é de **10 segundos por chamada**; consultas de sensores
+continuam com o prazo de 3 segundos. `ESP_COMMAND_TIMEOUT` no `.env` permite ajustar
+o prazo dos comandos. O valor padrão já é aplicado sem editar o `.env` existente.
+A quantidade continua sendo 3 pulsos para ligar e 1 para desligar, com intervalo
+de 350 ms entre as chamadas de ligar. O Arduino não muda nesta atualização.
+
+O firmware atende o WebServer e faz envios HTTP no mesmo loop. Durante um envio
+ele pode atrasar o atendimento de um comando. Aumentar o prazo reduz a chance de
+um timeout por esse atraso; não resolve por si só uma queda de Wi-Fi ou alimentação,
+nem comprova a causa de uma falha já ocorrida.
+
+Se uma chamada falhar, o comando registra pulsos confirmados e tentativas. O
+estado do dispositivo fica desconhecido, o automático da placa é pausado e as
+ações restantes da decisão não são executadas. Não há tentativa automática de
+completar o pulso faltante: ele pode ter ocorrido sem a confirmação chegar.
+O log e o painel tornam essa condição visível.
+
+Para recuperar: mantenha pausado, desligue fisicamente ambos os aparelhos,
+confira que estão desligados e clique **Confirmar ambos desligados**. Só depois
+selecione o modo e ative o automático. Reinicie o Flask após aplicar a atualização
+e faça primeiro um teste acompanhado antes de repetir um teste longo.

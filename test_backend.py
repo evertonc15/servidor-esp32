@@ -12,7 +12,7 @@ from sqlalchemy import select, create_engine, text
 from sqlalchemy.engine import make_url
 
 from app import create_app
-from storage import Command, Decision, Device, Feedback, Preference, Reading, utcnow, utc
+from storage import Command, Decision, Device, Feedback, Plate, Preference, Reading, utcnow, utc
 from esp_transport import PulseError
 
 
@@ -59,8 +59,79 @@ class ControllerIntegrationTest(unittest.TestCase):
         self.assertEqual(self.transport.set_state.call_count, 1)
         with self.store.session() as s:
             self.assertIsNone(s.get(Device, ('teste', 'ventilador')).state)
+            self.assertFalse(s.get(Plate, 'teste').automatic)
             c = s.scalar(select(Command))
             self.assertEqual((c.confirmed, c.attempted, c.status), (1, 2, 'falhou'))
+        status = self.client.get('/agente/status').json
+        self.assertTrue(status['precisa_sincronizar'])
+        self.assertIn('ventilador', status['alerta'])
+        self.assertEqual(self.client.post('/agente/configurar', json={'automatico': True}).status_code, 409)
+
+    def test_automatic_failure_stops_remaining_device_and_later_cycles(self):
+        self.setup_plate(mode='reativo')
+        self.transport.set_state.side_effect = PulseError(1, 2, 'timeout')
+        _, _, _, result = self.reading(temperature=30, humidity=35)
+        self.assertEqual(result, 'incompleta')
+        self.assertEqual(self.transport.set_state.call_args.args, ('192.168.2.9', 'ventilador', True))
+        self.transport.set_state.assert_called_once()
+        with self.store.session() as s:
+            d = s.scalar(select(Decision))
+            self.assertEqual(d.body['resultados'][1]['status'], 'nao_executado')
+            self.assertFalse(s.get(Device, ('teste', 'umidificador')).state)
+            self.assertFalse(s.get(Plate, 'teste').automatic)
+        pending = self.reading(temperature=30, humidity=35, process=False)
+        self.controller.process_reading(pending)
+        self.transport.set_state.assert_called_once()
+        with self.store.session() as s:
+            self.assertEqual(s.get(Reading, pending).status, 'automatico_pausado')
+
+    def test_existing_unknown_state_pauses_worker_and_sync_clears_warning(self):
+        self.setup_plate(mode='reativo')
+        with self.store.session() as s:
+            s.get(Device, ('teste', 'ventilador')).state = None
+        self.reading(temperature=30, humidity=35)
+        self.transport.set_state.assert_not_called()
+        status = self.client.get('/agente/status').json
+        self.assertFalse(status['automatico'])
+        self.assertTrue(status['precisa_sincronizar'])
+        self.client.post('/agente/sincronizar', json={'ventilador': False, 'umidificador': False})
+        status = self.client.get('/agente/status').json
+        self.assertFalse(status['precisa_sincronizar'])
+        self.assertIsNone(status['alerta'])
+        self.assertFalse(status['automatico'])
+
+    def test_humidifier_partial_failure_like_overnight_test_pauses_automation(self):
+        self.setup_plate(mode='reativo')
+        self.transport.set_state.side_effect = PulseError(1, 2, 'timed out')
+        _, _, _, status = self.reading(temperature=22.3, humidity=38)
+        self.assertEqual(status, 'incompleta')
+        self.transport.set_state.assert_called_once_with('192.168.2.9', 'umidificador', True)
+        current = self.client.get('/agente/status').json
+        self.assertFalse(current['automatico'])
+        self.assertIsNone(current['estados_estimados']['umidificador'])
+        self.assertFalse(current['estados_estimados']['ventilador'])
+        with self.store.session() as s:
+            command = s.scalar(select(Command))
+            self.assertEqual((command.requested, command.confirmed, command.attempted), (3, 1, 2))
+
+    def test_unknown_second_device_cancels_first_device_before_any_pulse(self):
+        self.setup_plate(mode='reativo')
+        with self.store.session() as s:
+            s.get(Device, ('teste', 'umidificador')).state = None
+        _, _, plan, status = self.reading(temperature=30, humidity=35)
+        self.assertEqual(status, 'incompleta')
+        self.assertEqual([r['status'] for r in plan['resultados']], ['nao_executado', 'estado_desconhecido'])
+        self.transport.set_state.assert_not_called()
+        with self.store.session() as s:
+            self.assertFalse(s.get(Device, ('teste', 'ventilador')).state)
+            self.assertFalse(s.get(Plate, 'teste').automatic)
+
+    def test_command_wait_can_be_configured_without_changing_sensor_timeout(self):
+        app = create_app({'DATABASE_URL': self.url, 'START_WORKER': False, 'ESP_COMMAND_TIMEOUT': '12'})
+        self.apps.append(app)
+        transport = app.extensions['controller'].transport
+        self.assertEqual(transport.command_timeout, 12)
+        self.assertEqual(transport.timeout, 3)
 
     def test_fixed_ip_metadata_and_panel_alias_do_not_send_pulses(self):
         result = self.client.get('/meuip?placa=teste&ip=192.168.2.5&ip_fixo=1')

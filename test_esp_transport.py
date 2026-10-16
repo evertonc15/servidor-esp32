@@ -20,7 +20,7 @@ class PulseTransportTest(unittest.TestCase):
                 with patch.object(self.transport, "read", return_value="OK") as read:
                     confirmed = self.transport.set_state(self.ip, dispositivo, True)
                 self.assertEqual(confirmed, 3)
-                self.assertEqual(read.call_args_list, [call(self.ip, "/" + dispositivo)] * 3)
+                self.assertEqual(read.call_args_list, [call(self.ip, "/" + dispositivo, timeout=10)] * 3)
                 self.assertEqual(self.sleep.call_args_list, [call(0.35), call(0.35)])
 
     def test_desligar_um_pulso_sem_pausa(self):
@@ -29,7 +29,7 @@ class PulseTransportTest(unittest.TestCase):
                 with patch.object(self.transport, "read", return_value="OK") as read:
                     confirmed = self.transport.set_state(self.ip, dispositivo, False)
                 self.assertEqual(confirmed, 1)
-                read.assert_called_once_with(self.ip, "/" + dispositivo)
+                read.assert_called_once_with(self.ip, "/" + dispositivo, timeout=10)
         self.sleep.assert_not_called()
 
     def test_timeout_no_segundo_pulso_aborta_sem_retry(self):
@@ -74,6 +74,22 @@ class PulseTransportTest(unittest.TestCase):
 class ReadTransportTest(unittest.TestCase):
     def setUp(self):
         self.transport = EspTransport(timeout=3, sleep=Mock())
+
+    @patch("esp_transport.http.client.HTTPConnection")
+    def test_command_wait_is_longer_and_does_not_change_read_wait(self, factory):
+        response = factory.return_value.getresponse.return_value
+        response.status = 200
+        response.read.return_value = b'OK'
+        self.transport.set_state('192.168.2.9', 'umidificador', True)
+        self.assertEqual(factory.call_args_list, [call('192.168.2.9', 80, timeout=10)] * 3)
+        self.transport.read('192.168.2.9', '/nivel')
+        self.assertEqual(factory.call_args, call('192.168.2.9', 80, timeout=3))
+
+    def test_invalid_command_deadlines_are_rejected_before_network_access(self):
+        for value in (0, -1, float('nan'), float('inf')):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    EspTransport(command_timeout=value)
 
     @patch("esp_transport.http.client.HTTPConnection")
     def test_get_fixo_sem_redirect_e_conexao_fechada(self, factory):

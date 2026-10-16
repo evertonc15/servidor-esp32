@@ -119,6 +119,19 @@ class LogsTest(unittest.TestCase):
         self.assertIsNone(record['dispositivos']['ventilador']['estado_estimado'])
         self.assertIn('andamento', record['dispositivos']['ventilador']['descricao'])
 
+    def test_cancelled_device_keeps_prior_state_and_does_not_claim_pulses(self):
+        self.seed(failed=True)
+        with self.store.session() as s:
+            decision = s.get(Decision, 'd1')
+            decision.body = dict(decision.body, resultados=[
+                {'dispositivo': 'ventilador', 'status': 'falhou'},
+                {'dispositivo': 'umidificador', 'status': 'nao_executado'}])
+        record = self.client.get('/log/json').json['registros'][1]
+        humidifier = record['dispositivos']['umidificador']
+        self.assertTrue(humidifier['estado_estimado'])
+        self.assertEqual(humidifier['status'], 'nao_executado')
+        self.assertEqual(humidifier['pulsos_confirmados'], 0)
+
     def test_limit_applies_to_readings_and_plate_filter(self):
         self.seed()
         with self.store.session() as s:

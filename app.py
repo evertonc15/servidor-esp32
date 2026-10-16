@@ -11,19 +11,23 @@ from sqlalchemy.exc import SQLAlchemyError
 from controller import Controller, Conflict
 from esp_backend import instalar
 from storage import Store
+from esp_transport import EspTransport
 
 
 def create_app(config=None, transport=None):
     load_dotenv(Path(__file__).with_name('.env'))
     app = Flask(__name__)
     app.config.update(DATABASE_URL=os.getenv('DATABASE_URL'), START_WORKER=True,
-                      SENSOR_MAX_AGE=300, TIMEZONE='America/Sao_Paulo')
+                      SENSOR_MAX_AGE=300, TIMEZONE='America/Sao_Paulo',
+                      ESP_COMMAND_TIMEOUT=os.getenv('ESP_COMMAND_TIMEOUT', '10'))
     if config:
         app.config.update(config)
     if not app.config['DATABASE_URL']:
         raise RuntimeError('Configure DATABASE_URL no arquivo .env. Veja README.md ou execute preparar_banco.py.')
     store = Store(app.config['DATABASE_URL'])
     store.initialize()
+    if transport is None:
+        transport = EspTransport(command_timeout=app.config['ESP_COMMAND_TIMEOUT'])
     controller = Controller(store, transport, app.config['SENSOR_MAX_AGE'], app.config['TIMEZONE'])
     app.extensions.update(store=store, controller=controller)
     instalar(app, store, controller)

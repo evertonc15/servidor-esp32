@@ -19,6 +19,8 @@ NOMES = {'ventilador': 'Ventilador', 'umidificador': 'Umidificador'}
 def _dispositivo(nome, decisao, comando):
     proposta = next((p for p in decisao.body.get('propostas', [])
                      if p.get('dispositivo') == nome), {}) if decisao else {}
+    resultado = next((r for r in decisao.body.get('resultados', [])
+                      if r.get('dispositivo') == nome), {}) if decisao else {}
     estado, status, descricao = None, 'sem_decisao', 'Sem decisão registrada.'
     solicitados = confirmados = 0
     if comando is not None:
@@ -33,6 +35,9 @@ def _dispositivo(nome, decisao, comando):
             descricao = f'{acao}: {status}; {confirmados}/{solicitados} pulsos confirmados.'
             if comando.error:
                 descricao += ' ' + comando.error
+    elif resultado.get('status') == 'nao_executado':
+        estado = proposta.get('estado_anterior')
+        status, descricao = 'nao_executado', 'Não executado; automático pausado após falha em outro dispositivo.'
     elif proposta:
         if proposta.get('bloqueado'):
             status, descricao = 'estado_desconhecido', 'Estado desconhecido; sincronização necessária.'
